@@ -1,0 +1,42 @@
+{
+  "symbols": {
+    "tracked": [
+      "NVDA",
+      "MSFT",
+      "AMZN",
+      "META",
+      "GOOGL"
+    ],
+    "ignored": [
+      "COST"
+    ]
+  },
+  "dca": {
+    "monthly_budget_usd": 1000,
+    "target_weights_pct": {
+      "MSFT": 30,
+      "AMZN": 20,
+      "GOOGL": 22,
+      "META": 18,
+      "NVDA": 10
+    },
+    "block_if_current_weight_pct_ge_target": true,
+    "block_tolerance_pct": 0.0
+  },
+  "opportunistic": {
+    "monthly_budget_usd": 3000,
+    "allow_exceed_available_cash": false,
+    "drawdown_entry_threshold_pct": -15,
+    "buy_pct_at_entry": 0.3,
+    "drawdown_full_allocation_pct": -25,
+    "max_position_weight_pct_default": 20,
+    "max_position_weight_pct_overrides": {
+      "MSFT": 35
+    },
+    "per_symbol_monthly_cap_usd": 1500,
+    "forbid_nvda_when_largest_holding": true,
+    "ma200_penalty_start_pct": 0.0,
+    "ma200_penalty_full_pct": 10.0,
+    "ma200_max_penalty": 0.5
+  }
+}
