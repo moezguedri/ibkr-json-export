@@ -5,7 +5,7 @@ monthly_engine.py
 Reads an IBKR+market snapshot JSON produced by ibkr_to_json.py and prints:
 - DCA (baseline) allocations
 - Opportunistic allocations (drawdown + MA200 pacing, no binary triggers)
-- Machine-readable output JSON (optional)
+- NEW: Opportunistic TRANCHE-2 LIMIT orders (statefulness without saving state)
 
 Design goals:
 - Minimal deps (stdlib only)
@@ -30,9 +30,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -76,6 +75,31 @@ def round_money(x: float) -> float:
     return float(f"{x:.2f}")
 
 
+def iso_utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def month_key_utc() -> str:
+    d = datetime.now(timezone.utc)
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def compute_gtd_end_of_month_utc(hour: int = 20, minute: int = 0) -> str:
+    """
+    GTD end of month timestamp (UTC) as ISO string. This is only for reporting.
+    (Your order placement layer can convert this to broker-specific format.)
+    """
+    d = datetime.now(timezone.utc)
+    year, month = d.year, d.month
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        next_month = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+    end_month = next_month - timedelta(seconds=1)  # 23:59:59 last day
+    # Replace time to desired hour:minute, clamp to same day
+    return end_month.replace(hour=hour, minute=minute, second=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # ----------------------------- configuration ----------------------------- #
 
 @dataclass(frozen=True)
@@ -84,6 +108,17 @@ class DcaConfig:
     target_weights_pct: Dict[str, float]
     block_if_current_weight_pct_ge_target: bool
     block_tolerance_pct: float  # allow small drift
+
+
+@dataclass(frozen=True)
+class Tranche2LimitConfig:
+    enabled: bool
+    drawdown_unlock_threshold_pct: float  # e.g. -20
+    # MA200 threshold multiplier per symbol: price <= MA200 * multiplier
+    ma200_threshold_multipliers: Dict[str, float]  # e.g. {"GOOGL": 1.02, "AMZN": 1.03}
+    tif: str  # "GTD" or "GTC" (recommend GTD)
+    gtd_end_of_month_utc_hour: int
+    gtd_end_of_month_utc_minute: int
 
 
 @dataclass(frozen=True)
@@ -106,10 +141,11 @@ class OpportunisticConfig:
     ma200_penalty_full_pct: float   # e.g. 10 -> full penalty by +10% above MA200
     ma200_max_penalty: float        # e.g. 0.50 -> at most cut buy by 50%
 
+    tranche2_limit: Tranche2LimitConfig
+
 
 @dataclass(frozen=True)
 class EngineConfig:
-
     tracked_symbols: List[str]
     ignored_symbols: List[str]
     dca: DcaConfig
@@ -131,6 +167,17 @@ def load_config(config_path: Path) -> EngineConfig:
     )
 
     opp_raw = raw["opportunistic"]
+
+    tr2_raw = opp_raw.get("tranche2_limit", {})
+    tranche2_limit = Tranche2LimitConfig(
+        enabled=bool(tr2_raw.get("enabled", True)),
+        drawdown_unlock_threshold_pct=float(tr2_raw.get("drawdown_unlock_threshold_pct", -20.0)),
+        ma200_threshold_multipliers={k.upper(): float(v) for k, v in tr2_raw.get("ma200_threshold_multipliers", {}).items()},
+        tif=str(tr2_raw.get("tif", "GTD")).upper(),
+        gtd_end_of_month_utc_hour=int(tr2_raw.get("gtd_end_of_month_utc_hour", 20)),
+        gtd_end_of_month_utc_minute=int(tr2_raw.get("gtd_end_of_month_utc_minute", 0)),
+    )
+
     opportunistic = OpportunisticConfig(
         monthly_budget_usd=float(opp_raw["monthly_budget_usd"]),
         allow_exceed_available_cash=bool(opp_raw.get("allow_exceed_available_cash", False)),
@@ -146,6 +193,8 @@ def load_config(config_path: Path) -> EngineConfig:
         ma200_penalty_start_pct=float(opp_raw.get("ma200_penalty_start_pct", 0.0)),
         ma200_penalty_full_pct=float(opp_raw.get("ma200_penalty_full_pct", 10.0)),
         ma200_max_penalty=float(opp_raw.get("ma200_max_penalty", 0.50)),
+
+        tranche2_limit=tranche2_limit,
     )
 
     return EngineConfig(
@@ -249,6 +298,10 @@ def get_largest_holding_symbol(snapshot: Dict[str, Any]) -> Optional[str]:
     return snapshot.get("portfolio", {}).get("derived", {}).get("largest_holding_stock_symbol")
 
 
+def get_symbol_core(snapshot: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    return snapshot.get("symbols", {}).get(symbol, {}).get("core_metrics", {}) or {}
+
+
 def build_dca_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
     """
     Baseline DCA: distribute monthly budget by target weights.
@@ -298,19 +351,15 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
            intensity(drawdown) * pacing_multiplier(price_vs_ma200)
       4) Per-symbol monthly cap applies.
       5) Leftover remains as cash (not reallocated).
-
-    Returns: (plan, spent, effective_budget_used_for_split)
     """
     opp = cfg.opportunistic
 
-    # Budget: optionally cap by available cash.
     desired_budget = opp.monthly_budget_usd
     available_cash = get_available_cash_usd(snapshot)
     if (not opp.allow_exceed_available_cash) and (not math.isnan(available_cash)):
         effective_budget = min(desired_budget, available_cash)
     else:
         effective_budget = desired_budget
-
     effective_budget = max(0.0, float(effective_budget))
 
     largest = get_largest_holding_symbol(snapshot)
@@ -330,7 +379,7 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
         if opp.forbid_nvda_when_largest_holding and symbol.upper() == "NVDA" and (largest or "").upper() == "NVDA":
             reasons.append("NVDA_blocked: NVDA is currently the largest holding")
 
-        core = snapshot.get("symbols", {}).get(symbol, {}).get("core_metrics", {})
+        core = get_symbol_core(snapshot, symbol)
         drawdown = safe_float(core.get("drawdown_12m_close_pct"), default=float("nan"))
         if math.isnan(drawdown) or drawdown > opp.drawdown_entry_threshold_pct:
             reasons.append(f"not_eligible: drawdown_12m_close_pct {drawdown if not math.isnan(drawdown) else 'NaN'} > entry_threshold {opp.drawdown_entry_threshold_pct}")
@@ -344,7 +393,6 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
     spent = 0.0
 
     if not eligible or effective_budget <= 0:
-        # Still emit structured output for all symbols
         for symbol in cfg.tracked_symbols:
             plan[symbol] = {
                 "eligible": False,
@@ -360,7 +408,7 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
     base_budget = effective_budget / len(eligible)
 
     for symbol in cfg.tracked_symbols:
-        core = snapshot.get("symbols", {}).get(symbol, {}).get("core_metrics", {})
+        core = get_symbol_core(snapshot, symbol)
         drawdown = safe_float(core.get("drawdown_12m_close_pct"), default=float("nan"))
         price_vs_ma200 = safe_float(core.get("price_vs_ma200_pct"), default=float("nan"))
         current_weight = get_portfolio_weight_pct(snapshot, symbol)
@@ -419,6 +467,116 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
     return plan, spent, effective_budget
 
 
+def build_tranche2_limit_orders(
+    cfg: EngineConfig,
+    snapshot: Dict[str, Any],
+    opp_plan: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    TRANCHE 2 design (your chosen variant):
+      - TR1 is bought "now" (from opp_plan capped_amount_usd).
+      - TR2 is a LIMIT order only.
+      - TR2 should only trigger if BOTH are true:
+          (a) drawdown_12m_close_pct <= unlock_threshold (e.g. -20%)
+          (b) price <= ma200_close * multiplier(symbol)
+        We encode (a)&(b) as a single limit price:
+          limit_price = min(high_12m_close*(1+unlock/100), ma200_close*multiplier)
+    Amount:
+      - remaining per-symbol budget = base_budget - tranche1_amount
+      - capped by per_symbol_monthly_cap_usd
+      - if remaining <= 0 => no TR2 order
+    """
+    opp = cfg.opportunistic
+    tr2 = opp.tranche2_limit
+
+    if not tr2.enabled:
+        return [], []
+
+    warnings: List[str] = []
+    orders: List[Dict[str, Any]] = []
+
+    # Determine base_budget from any eligible symbol (present in plan), else 0
+    eligible_symbols = [s for s in cfg.tracked_symbols if opp_plan.get(s, {}).get("eligible")]
+    base_budget = safe_float(opp_plan[eligible_symbols[0]].get("base_budget_usd"), default=0.0) if eligible_symbols else 0.0
+
+    # TIF formatting for reporting
+    if tr2.tif == "GTD":
+        # end of month UTC time
+        # NOTE: we intentionally keep this simple and only for output.
+        # Your order sender can convert it to IBKR's GTD format.
+        from datetime import timedelta  # local import to keep header clean
+        gtd_until_utc = compute_gtd_end_of_month_utc(tr2.gtd_end_of_month_utc_hour, tr2.gtd_end_of_month_utc_minute)
+    else:
+        gtd_until_utc = None
+
+    for symbol in cfg.tracked_symbols:
+        rec = opp_plan.get(symbol, {})
+        tranche1_amount = safe_float(rec.get("capped_amount_usd"), default=0.0)
+
+        # Only generate TR2 if TR1 is actually planned to buy now (>0)
+        if tranche1_amount <= 0.0:
+            continue
+
+        # Remaining budget for this symbol (by construction base_budget is per eligible symbol)
+        remaining = max(0.0, base_budget - tranche1_amount)
+        tranche2_amount = min(remaining, opp.per_symbol_monthly_cap_usd)
+
+        tranche2_amount = round_money(tranche2_amount)
+        if tranche2_amount <= 0.0:
+            continue
+
+        core = get_symbol_core(snapshot, symbol)
+        high_12m_close = safe_float(core.get("high_12m_close"), default=float("nan"))
+        ma200_close = safe_float(core.get("ma200_close"), default=float("nan"))
+
+        if math.isnan(high_12m_close) or math.isnan(ma200_close):
+            warnings.append(
+                f"{symbol}: cannot compute TR2 limit (need high_12m_close and ma200_close). "
+                f"Got high_12m_close={core.get('high_12m_close')}, ma200_close={core.get('ma200_close')}."
+            )
+            continue
+
+        # (a) drawdown unlock threshold price
+        unlock_dd = tr2.drawdown_unlock_threshold_pct  # e.g. -20
+        price_dd_unlock = high_12m_close * (1.0 + unlock_dd / 100.0)  # -20 => *0.80
+
+        # (b) ma200 threshold price
+        mult = tr2.ma200_threshold_multipliers.get(symbol.upper(), 1.0)
+        price_ma2 = ma200_close * mult
+
+        # Encode (a)&(b) by taking the stricter (lower) price
+        limit_price = min(price_dd_unlock, price_ma2)
+        limit_price = round_money(limit_price)
+
+        rationale = {
+            "unlock_rule": f"DD12M <= {unlock_dd:.2f}% AND price <= MA200*multiplier",
+            "computed": {
+                "high_12m_close": round_money(high_12m_close),
+                "ma200_close": round_money(ma200_close),
+                "ma200_multiplier": mult,
+                "price_dd_unlock": round_money(price_dd_unlock),
+                "price_ma200_threshold": round_money(price_ma2),
+                "limit_price": limit_price,
+            }
+        }
+
+        orders.append({
+            "symbol": symbol,
+            "side": "BUY",
+            "order_type": "LMT",
+            "amount_usd": tranche2_amount,
+            "limit_price": limit_price,
+            "tif": tr2.tif,
+            "gtd_until_utc": gtd_until_utc,
+            "tag": f"OPP_TR2_{month_key_utc()}",
+            "rationale": rationale,
+        })
+
+    return orders, warnings
+
+
+# ----------------------------- reporting ----------------------------- #
+
 def format_table_row(cols: List[str], widths: List[int]) -> str:
     padded = []
     for c, w in zip(cols, widths):
@@ -440,7 +598,6 @@ def print_opportunistic_walkthrough(cfg: EngineConfig, snapshot: Dict[str, Any],
     print("    - and not blocked by risk locks (max weight cap, NVDA lock if enabled)")
     print("")
 
-    # Identify eligible symbols (as determined by the engine)
     eligible = [s for s in cfg.tracked_symbols if opp_plan.get(s, {}).get("eligible")]
     blocked = [s for s in cfg.tracked_symbols if s not in eligible]
 
@@ -449,12 +606,11 @@ def print_opportunistic_walkthrough(cfg: EngineConfig, snapshot: Dict[str, Any],
         print("")
         return
 
-    base_budget = opp_plan[eligible[0]].get("base_budget_usd", 0.0) if eligible else 0.0
+    base_budget = safe_float(opp_plan[eligible[0]].get("base_budget_usd"), default=0.0)
     print(f"  Eligible symbols ({len(eligible)}): {', '.join(eligible)}")
     print(f"  Base budget per eligible symbol (effective_budget / N_actives): {base_budget:.2f} USD")
     print("")
 
-    # Explain each eligible symbol with the math
     for symbol in eligible:
         rec = opp_plan[symbol]
         dd = safe_float(rec.get("drawdown_12m_close_pct"))
@@ -475,12 +631,10 @@ def print_opportunistic_walkthrough(cfg: EngineConfig, snapshot: Dict[str, Any],
         else:
             print(f"    price_vs_ma200_pct = NaN → MA200 pacing multiplier = {mult:.4f}")
 
-        # Show the linear drawdown mapping math
         entry = opp.drawdown_entry_threshold_pct
         full = opp.drawdown_full_allocation_pct
         buy_at_entry = opp.buy_pct_at_entry
 
-        # progress = (entry - dd) / (entry - full)
         if (not math.isnan(dd)) and (full < entry):
             numer = entry - dd
             denom = entry - full
@@ -501,7 +655,6 @@ def print_opportunistic_walkthrough(cfg: EngineConfig, snapshot: Dict[str, Any],
 
         print("")
 
-    # Explain why blocked got 0
     if blocked:
         print("  Why the other symbols got 0 opportunistic allocation:")
         for symbol in blocked:
@@ -512,7 +665,6 @@ def print_opportunistic_walkthrough(cfg: EngineConfig, snapshot: Dict[str, Any],
                 print(f"    - {symbol}: not eligible")
         print("")
 
-    # Summarize spend vs leftover
     spent = totals["opp_spent_usd"]
     eff = totals["opp_effective_budget_usd"]
     leftover = max(0.0, eff - spent)
@@ -521,33 +673,66 @@ def print_opportunistic_walkthrough(cfg: EngineConfig, snapshot: Dict[str, Any],
     print("")
 
 
-def print_report(cfg: EngineConfig, snapshot_path: Path, snapshot: Dict[str, Any], dca_plan: Dict[str, Any], opp_plan: Dict[str, Any], totals: Dict[str, float]) -> None:
+def print_tranche2_orders(orders: List[Dict[str, Any]], warnings: List[str]) -> None:
+    print("Opportunistic Tranche-2 LIMIT Orders (stateful without saving state):")
+    if warnings:
+        for w in warnings:
+            print(f"  WARNING: {w}")
+        print("")
+    if not orders:
+        print("  No TR2 limit orders generated this run.")
+        print("")
+        return
+
+    for o in orders:
+        sym = o["symbol"]
+        amt = o["amount_usd"]
+        lp = o["limit_price"]
+        tif = o["tif"]
+        gtd = o.get("gtd_until_utc")
+        comp = o["rationale"]["computed"]
+        print(f"  {sym}: BUY LMT amount={amt:.2f} USD @ limit_price={lp:.2f}  TIF={tif}" + (f"  GTD_until_utc={gtd}" if gtd else ""))
+        print(f"    limit_price = min(price_dd_unlock={comp['price_dd_unlock']:.2f}, price_ma200_threshold={comp['price_ma200_threshold']:.2f})")
+        print(f"    unlock rule: {o['rationale']['unlock_rule']}")
+        print("")
+
+
+def print_report(
+    cfg: EngineConfig,
+    snapshot_path: Path,
+    snapshot: Dict[str, Any],
+    dca_plan: Dict[str, Any],
+    opp_plan: Dict[str, Any],
+    totals: Dict[str, float],
+    tranche2_orders: List[Dict[str, Any]],
+    tranche2_warnings: List[str],
+) -> None:
     print("")
     print("=== Monthly Engine Report ===")
     print(f"snapshot_path: {snapshot_path}")
     print(f"generated_at_utc (snapshot.meta): {snapshot.get('meta', {}).get('generated_at_utc')}")
     print(f"mode (snapshot.meta): {snapshot.get('meta', {}).get('mode')}")
+    print(f"run_id_utc: {iso_utc_now()}")
     print("")
 
-    # Table
-    headers = ["SYMBOL", "WGT%", "DD12M%", "Px-vs-MA200%", "DCA_USD", "OPP_USD", "TOTAL_USD", "NOTES"]
-    widths = [6, 7, 7, 12, 8, 8, 9, 40]
+    headers = ["SYMBOL", "WGT%", "DD12M%", "Px-vs-MA200%", "DCA_USD", "OPP_TR1_USD", "TOTAL_USD", "NOTES"]
+    widths = [6, 7, 7, 12, 8, 11, 9, 40]
     print(format_table_row(headers, widths))
     print("-" * (sum(widths) + 3 * (len(widths) - 1)))
 
     for symbol in cfg.tracked_symbols:
         wgt = safe_float(dca_plan[symbol]["current_weight_pct"])
-        dd = safe_float(opp_plan[symbol]["drawdown_12m_close_pct"])
-        pv = safe_float(opp_plan[symbol]["price_vs_ma200_pct"])
+        dd = safe_float(opp_plan[symbol].get("drawdown_12m_close_pct", float("nan")))
+        pv = safe_float(opp_plan[symbol].get("price_vs_ma200_pct", float("nan")))
         dca_amt = safe_float(dca_plan[symbol]["final_amount_usd"], 0.0)
-        opp_amt = safe_float(opp_plan[symbol]["capped_amount_usd"], 0.0)
-        total_amt = dca_amt + opp_amt
+        opp_tr1_amt = safe_float(opp_plan[symbol].get("capped_amount_usd", 0.0), 0.0)
+        total_amt = dca_amt + opp_tr1_amt
 
         notes = []
         if dca_plan[symbol]["blocked"]:
             notes.append("DCA blocked: " + "; ".join(dca_plan[symbol]["block_reasons"]))
-        if not opp_plan[symbol]["eligible"]:
-            notes.append("Opp blocked: " + "; ".join(opp_plan[symbol]["blocked_reasons"]))
+        if not opp_plan[symbol].get("eligible", False):
+            notes.append("Opp blocked: " + "; ".join(opp_plan[symbol].get("blocked_reasons", [])))
 
         row = [
             symbol,
@@ -555,7 +740,7 @@ def print_report(cfg: EngineConfig, snapshot_path: Path, snapshot: Dict[str, Any
             f"{dd:5.2f}" if not math.isnan(dd) else "  NaN",
             f"{pv:8.2f}" if not math.isnan(pv) else "     NaN",
             f"{dca_amt:7.2f}",
-            f"{opp_amt:7.2f}",
+            f"{opp_tr1_amt:10.2f}",
             f"{total_amt:8.2f}",
             " | ".join(notes)[:widths[-1]],
         ]
@@ -564,29 +749,27 @@ def print_report(cfg: EngineConfig, snapshot_path: Path, snapshot: Dict[str, Any
     print("")
     print("Totals:")
     print(f"  DCA spent:           {totals['dca_spent_usd']:.2f} USD")
-    print(f"  Opportunistic spent: {totals['opp_spent_usd']:.2f} USD")
+    print(f"  Opportunistic TR1 spent: {totals['opp_spent_usd']:.2f} USD")
     print(f"  Combined spent:      {totals['total_spent_usd']:.2f} USD")
     if not math.isnan(totals.get("available_cash_usd", float("nan"))):
         print(f"  Available cash (USD): {totals['available_cash_usd']:.2f} USD")
     print(f"  Opportunistic effective budget used for split: {totals['opp_effective_budget_usd']:.2f} USD")
     print("")
 
-    # Detailed opportunistic explanation
     print_opportunistic_walkthrough(cfg, snapshot, opp_plan, totals)
+    print_tranche2_orders(tranche2_orders, tranche2_warnings)
 
-    # Methodology explanation (as you requested)
     print("Methodology (English):")
     print("  1) Baseline DCA: allocate the monthly DCA budget across symbols by target weights.")
     print("     If a symbol is already at/above its target weight, its DCA is blocked and NOT redistributed.")
-    print("  2) Opportunistic: only symbols with drawdown_12m_close_pct <= entry_threshold are considered.")
+    print("  2) Opportunistic TR1: only symbols with drawdown_12m_close_pct <= entry_threshold are considered.")
     print("     Eligible symbols share the opportunistic budget equally (N_actives).")
-    print("  3) For each eligible symbol, buy intensity is linear with drawdown:")
-    print("       - At entry drawdown (e.g. -15%), buy_intensity = buy_pct_at_entry (e.g. 30%).")
-    print("       - At full drawdown (e.g. -25%), buy_intensity = 100%.")
-    print("       - In-between: linear interpolation.")
-    print("  4) MA200 is NOT a binary trigger. It only slows down buys when price is far above MA200")
-    print("     (to preserve ammunition and avoid buying 'too early' when the market is not stressed).")
-    print("  5) Risk locks: max weight cap (default + optional per-symbol overrides) and NVDA blocked when it is the largest holding (optional).")
+    print("  3) TR1 intensity is linear with drawdown, paced by MA200 distance (not a binary trigger).")
+    print("  4) Opportunistic TR2 (LIMIT): generated only when TR1 amount > 0.")
+    print("     It encodes: DD12M <= unlock_threshold AND price <= MA200*multiplier as a single limit price:")
+    print("       limit_price = min(high_12m_close*(1+unlock/100), ma200_close*multiplier)")
+    print("     This adds statefulness without saving state files.")
+    print("  5) Risk locks: max weight cap (default + per-symbol overrides) and NVDA blocked when largest holding (optional).")
     print("  6) Any leftover budget remains cash (no forced redistribution).")
     print("")
 
@@ -595,11 +778,13 @@ def write_output_json(output_path: Path, payload: Dict[str, Any]) -> None:
     output_path.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
 
 
+# ----------------------------- main ----------------------------- #
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--snapshot", type=str, default=None, help="Path to a snapshot JSON. If omitted, uses latest in ./snapshots")
     parser.add_argument("--config", type=str, default="config.json", help="Path to config.json (default: ./config.json)")
-    parser.add_argument("--output", type=str, default=None, help="Optional output JSON path (allocations).")
+    parser.add_argument("--output", type=str, default=None, help="Optional output JSON path (allocations + orders).")
     args = parser.parse_args()
 
     config_path = Path(args.config).expanduser().resolve()
@@ -621,24 +806,37 @@ def main() -> int:
     dca_plan, dca_spent = build_dca_plan(cfg, snapshot)
     opp_plan, opp_spent, opp_effective_budget = build_opportunistic_plan(cfg, snapshot)
 
+    tranche2_orders, tranche2_warnings = build_tranche2_limit_orders(cfg, snapshot, opp_plan)
+
     totals = {
-        "dca_spent_usd": dca_spent,
-        "opp_spent_usd": opp_spent,
+        "dca_spent_usd": round_money(dca_spent),
+        "opp_spent_usd": round_money(opp_spent),
         "total_spent_usd": round_money(dca_spent + opp_spent),
         "available_cash_usd": get_available_cash_usd(snapshot),
         "opp_effective_budget_usd": round_money(opp_effective_budget),
     }
 
-    print_report(cfg, snapshot_path, snapshot, dca_plan, opp_plan, totals)
+    print_report(cfg, snapshot_path, snapshot, dca_plan, opp_plan, totals, tranche2_orders, tranche2_warnings)
 
     payload = {
         "meta": {
             "generated_at_local": datetime.now().isoformat(timespec="seconds"),
+            "generated_at_utc": iso_utc_now(),
+            "run_month_utc": month_key_utc(),
             "snapshot_path": str(snapshot_path),
             "config_path": str(config_path),
         },
         "dca": dca_plan,
         "opportunistic": opp_plan,
+        "orders": {
+            "opportunistic_tr1_buy_now": [
+                {"symbol": s, "amount_usd": round_money(safe_float(opp_plan.get(s, {}).get("capped_amount_usd"), 0.0))}
+                for s in cfg.tracked_symbols
+                if safe_float(opp_plan.get(s, {}).get("capped_amount_usd"), 0.0) > 0.0
+            ],
+            "opportunistic_tr2_limit": tranche2_orders,
+            "warnings": tranche2_warnings,
+        },
         "totals": totals,
     }
 

@@ -1,15 +1,7 @@
 {
   "symbols": {
-    "tracked": [
-      "NVDA",
-      "MSFT",
-      "AMZN",
-      "META",
-      "GOOGL"
-    ],
-    "ignored": [
-      "COST"
-    ]
+    "tracked": ["NVDA", "MSFT", "AMZN", "META", "GOOGL"],
+    "ignored": ["COST"]
   },
   "dca": {
     "monthly_budget_usd": 1000,
@@ -37,6 +29,20 @@
     "forbid_nvda_when_largest_holding": true,
     "ma200_penalty_start_pct": 0.0,
     "ma200_penalty_full_pct": 10.0,
-    "ma200_max_penalty": 0.5
+    "ma200_max_penalty": 0.5,
+    "tranche2_limit": {
+      "enabled": true,
+      "drawdown_unlock_threshold_pct": -20,
+      "ma200_threshold_multipliers": {
+        "MSFT": 1.0,
+        "GOOGL": 1.02,
+        "AMZN": 1.03,
+        "META": 1.0,
+        "NVDA": 1.0
+      },
+      "tif": "GTD",
+      "gtd_end_of_month_utc_hour": 20,
+      "gtd_end_of_month_utc_minute": 0
+    }
   }
 }
