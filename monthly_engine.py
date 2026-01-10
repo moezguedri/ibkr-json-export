@@ -31,7 +31,7 @@ import argparse
 import json
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -759,7 +759,7 @@ def print_report(
     print_opportunistic_walkthrough(cfg, snapshot, opp_plan, totals)
     print_tranche2_orders(tranche2_orders, tranche2_warnings)
 
-    print("Methodology (English):")
+    print("Methodology:")
     print("  1) Baseline DCA: allocate the monthly DCA budget across symbols by target weights.")
     print("     If a symbol is already at/above its target weight, its DCA is blocked and NOT redistributed.")
     print("  2) Opportunistic TR1: only symbols with drawdown_12m_close_pct <= entry_threshold are considered.")
