@@ -1,21 +1,44 @@
 #!/usr/bin/env python3
 """
-monthly_engine.py
+MONTHLY ENGINE – DESIGN CONTRACT (READ THIS FIRST)
 
-Reads an IBKR+market snapshot JSON produced by ibkr_to_json.py and prints:
-- DCA (baseline) allocations
-- Opportunistic allocations (drawdown + MA200 pacing, no binary triggers)
-- NEW: Opportunistic TRANCHE-2 LIMIT orders (statefulness without saving state)
+This file implements a DISCIPLINE ENGINE, not an optimizer and not a trading bot.
 
-Design goals:
-- Minimal deps (stdlib only)
-- Explicit / readable names (no "dd", no cryptic abbreviations)
-- Configuration-driven (config.json)
-- Deterministic + explainable output
+CORE PHILOSOPHY
+---------------
+- Risk-first, not return-maximizing
+- Deterministic, explainable, auditable
+- No reaction to short-term noise
+- No dependency on precise market timing
+
+The engine answers ONE question:
+"Given today’s snapshot, how much am I allowed to buy NOW,
+ and under which conditions am I allowed to buy MORE later?"
+
+UNIVERSES
+---------
+1) ACTIONS (core portfolio)
+   - Baseline DCA by target weights
+   - Opportunistic overlay based on 12m drawdown + MA200 pacing
+   - Hard caps on position weights
+   - Cash accumulation is intentional (blocked DCA is not redistributed)
+
+2) BTC (ETF, satellite)
+   - Opportunistic ONLY (no DCA)
+   - Same methodology as actions but different thresholds (BTC is more volatile)
+   - BTC is NOT constrained by the actions position-weight caps in this file
+   - BTC budget is NOT cash-constrained by the snapshot (cash can be deposited later)
+
+IMPORTANT NON-OBVIOUS RULES
+---------------------------
+- Drawdowns are treated as CONTINUOUS variables, not binary triggers (linear intensity).
+- MA200 is used for PACING (throttling), not timing. It is NOT an entry signal.
+- TRANCHE-2 uses LIMIT orders to encode future conditions ("statefulness without state").
+- Snapshot cash is NOT a hard constraint (the engine decides allocation, execution can happen later).
 
 USAGE
 -----
-# Use latest snapshot in ./snapshots and ./config.json
+# Uses ./config.json and latest snapshot in ./snapshots
 python monthly_engine.py
 
 # Explicit snapshot path
@@ -23,9 +46,41 @@ python monthly_engine.py --snapshot snapshots/portfolio_snapshot_YYYYMMDD_HHMM.j
 
 # Explicit config path + write output allocations JSON
 python monthly_engine.py --config config.json --output allocations.json
+
+CONFIG SHAPE (minimal)
+----------------------
+{
+  "symbols": {
+    "tracked": ["NVDA", "MSFT", "AMZN", "META", "GOOGL"],
+    "btc": { "symbol": "IBIT" }              # optional (omit to disable BTC checks)
+  },
+  "dca": {
+    "monthly_budget_usd": 1000,
+    "target_weights_pct": { ... },
+    "block_if_current_weight_pct_ge_target": true,
+    "block_tolerance_pct": 0.0
+  },
+  "opportunistic": { ... },                  # actions opportunistic
+  "btc": {                                   # optional (if present, BTC opportunistic enabled)
+    "monthly_budget_usd": 300,
+    "opportunistic": { ... }                 # BTC thresholds + TR2 limit config
+  }
+}
+
+SNAPSHOT ASSUMPTIONS
+--------------------
+This engine expects an IBKR+market snapshot JSON with at least:
+- portfolio.derived.tracked_weights_pct (for tracked action symbols)
+- symbols.<SYMBOL>.core_metrics.drawdown_12m_close_pct
+- symbols.<SYMBOL>.core_metrics.price_vs_ma200_pct
+- symbols.<SYMBOL>.core_metrics.high_12m_close
+- symbols.<SYMBOL>.core_metrics.ma200_close
+
+If BTC is enabled, the BTC ETF symbol must exist under snapshot["symbols"] too.
 """
 
 from __future__ import annotations
+import yfinance as yf
 
 import argparse
 import json
@@ -115,7 +170,7 @@ class Tranche2LimitConfig:
     enabled: bool
     drawdown_unlock_threshold_pct: float  # e.g. -20
     # MA200 threshold multiplier per symbol: price <= MA200 * multiplier
-    ma200_threshold_multipliers: Dict[str, float]  # e.g. {"GOOGL": 1.02, "AMZN": 1.03}
+    ma200_threshold_multipliers: Dict[str, float]  # actions (per symbol)
     tif: str  # "GTD" or "GTC" (recommend GTD)
     gtd_end_of_month_utc_hour: int
     gtd_end_of_month_utc_minute: int
@@ -123,8 +178,11 @@ class Tranche2LimitConfig:
 
 @dataclass(frozen=True)
 class OpportunisticConfig:
+    """
+    Used for ACTIONS opportunistic.
+    Note: cash is NOT a constraint (budget is used as-is); execution can happen after deposit/FX.
+    """
     monthly_budget_usd: float
-    allow_exceed_available_cash: bool  # if False, cap by TotalCashValue_USD
     drawdown_entry_threshold_pct: float  # e.g. -15
     buy_pct_at_entry: float  # e.g. 0.30 -> 30% at entry threshold
     drawdown_full_allocation_pct: float  # e.g. -25 -> 100%
@@ -134,7 +192,6 @@ class OpportunisticConfig:
     max_position_weight_pct_overrides: Dict[str, float]  # e.g. {"MSFT": 35}
 
     per_symbol_monthly_cap_usd: float  # e.g. 1500
-    forbid_nvda_when_largest_holding: bool
 
     # MA200 pacing: ONLY used to slow down when price is far above MA200.
     ma200_penalty_start_pct: float  # e.g. 0 -> starts penalizing above MA200
@@ -145,34 +202,92 @@ class OpportunisticConfig:
 
 
 @dataclass(frozen=True)
+class BtcTranche2Config:
+    enabled: bool
+    drawdown_unlock_threshold_pct: float
+    ma200_multiplier: float  # single multiplier for BTC ETF
+    tif: str
+    gtd_end_of_month_utc_hour: int
+    gtd_end_of_month_utc_minute: int
+
+
+@dataclass(frozen=True)
+class BtcOpportunisticConfig:
+    """
+    Used for BTC opportunistic (satellite).
+    BTC is more volatile => thresholds are configured separately in config.json.
+    """
+    monthly_budget_usd: float
+    drawdown_entry_threshold_pct: float
+    buy_pct_at_entry: float
+    drawdown_full_allocation_pct: float
+    per_monthly_cap_usd: float  # cap for the single BTC instrument
+    ma200_penalty_start_pct: float
+    ma200_penalty_full_pct: float
+    ma200_max_penalty: float
+    tranche2: BtcTranche2Config
+
+
+@dataclass(frozen=True)
+class SymbolsConfig:
+    tracked_actions: List[str]
+    btc_symbol: Optional[str]  # e.g. "IBIT" (None disables BTC)
+
+
+@dataclass(frozen=True)
 class EngineConfig:
-    tracked_symbols: List[str]
-    ignored_symbols: List[str]
+    symbols: SymbolsConfig
     dca: DcaConfig
     opportunistic: OpportunisticConfig
+    btc: Optional[BtcOpportunisticConfig]  # None disables BTC
+
+
+def _require_non_empty_list(raw: Any, key_path: str) -> List[str]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"config.json must include {key_path} as a non-empty list")
+    out = []
+    for x in raw:
+        s = str(x).strip().upper()
+        if s:
+            out.append(s)
+    if not out:
+        raise ValueError(f"config.json {key_path} resolved to empty symbols")
+    return out
 
 
 def load_config(config_path: Path) -> EngineConfig:
+    """
+    Config is expected to be explicit and deterministic:
+    - tracked action symbols MUST come from config (no auto-derivation from snapshot)
+    """
     raw = json.loads(config_path.read_text(encoding="utf-8"))
 
-    tracked_symbols = list(raw["symbols"]["tracked"])
-    ignored_symbols = list(raw.get("symbols", {}).get("ignored", []))
+    # -------- symbols
+    symbols_raw = raw.get("symbols", {})
+    tracked_symbols = _require_non_empty_list(symbols_raw.get("tracked"), "symbols.tracked")
+    btc_symbol = None
+    btc_raw_sym = (symbols_raw.get("btc") or {}).get("symbol")
+    if btc_raw_sym:
+        btc_symbol = str(btc_raw_sym).strip().upper() or None
 
+    symbols_cfg = SymbolsConfig(tracked_actions=tracked_symbols, btc_symbol=btc_symbol)
+
+    # -------- DCA (actions)
     dca_raw = raw["dca"]
     dca = DcaConfig(
         monthly_budget_usd=float(dca_raw["monthly_budget_usd"]),
-        target_weights_pct={k: float(v) for k, v in dca_raw["target_weights_pct"].items()},
+        target_weights_pct={k.upper(): float(v) for k, v in dca_raw["target_weights_pct"].items()},
         block_if_current_weight_pct_ge_target=bool(dca_raw.get("block_if_current_weight_pct_ge_target", True)),
         block_tolerance_pct=float(dca_raw.get("block_tolerance_pct", 0.0)),
     )
 
+    # -------- Opportunistic (actions)
     opp_raw = raw["opportunistic"]
-
-    tr2_raw = opp_raw.get("tranche2_limit", {})
+    tr2_raw = opp_raw.get("tranche2_limit") or opp_raw.get("tranche2") or {}
     tranche2_limit = Tranche2LimitConfig(
         enabled=bool(tr2_raw.get("enabled", True)),
-        drawdown_unlock_threshold_pct=float(tr2_raw.get("drawdown_unlock_threshold_pct", -20.0)),
-        ma200_threshold_multipliers={k.upper(): float(v) for k, v in tr2_raw.get("ma200_threshold_multipliers", {}).items()},
+        drawdown_unlock_threshold_pct=float(tr2_raw.get("drawdown_unlock_threshold_pct", tr2_raw.get("drawdown_unlock_threshold_pct", -20.0))),
+        ma200_threshold_multipliers={k.upper(): float(v) for k, v in (tr2_raw.get("ma200_threshold_multipliers") or {}).items()},
         tif=str(tr2_raw.get("tif", "GTD")).upper(),
         gtd_end_of_month_utc_hour=int(tr2_raw.get("gtd_end_of_month_utc_hour", 20)),
         gtd_end_of_month_utc_minute=int(tr2_raw.get("gtd_end_of_month_utc_minute", 0)),
@@ -180,29 +295,45 @@ def load_config(config_path: Path) -> EngineConfig:
 
     opportunistic = OpportunisticConfig(
         monthly_budget_usd=float(opp_raw["monthly_budget_usd"]),
-        allow_exceed_available_cash=bool(opp_raw.get("allow_exceed_available_cash", False)),
         drawdown_entry_threshold_pct=float(opp_raw["drawdown_entry_threshold_pct"]),
         buy_pct_at_entry=float(opp_raw["buy_pct_at_entry"]),
         drawdown_full_allocation_pct=float(opp_raw["drawdown_full_allocation_pct"]),
-
         max_position_weight_pct_default=float(opp_raw.get("max_position_weight_pct_default", opp_raw.get("max_position_weight_pct", 20.0))),
-        max_position_weight_pct_overrides={k.upper(): float(v) for k, v in opp_raw.get("max_position_weight_pct_overrides", {}).items()},
-
+        max_position_weight_pct_overrides={k.upper(): float(v) for k, v in (opp_raw.get("max_position_weight_pct_overrides") or {}).items()},
         per_symbol_monthly_cap_usd=float(opp_raw["per_symbol_monthly_cap_usd"]),
-        forbid_nvda_when_largest_holding=bool(opp_raw.get("forbid_nvda_when_largest_holding", True)),
         ma200_penalty_start_pct=float(opp_raw.get("ma200_penalty_start_pct", 0.0)),
         ma200_penalty_full_pct=float(opp_raw.get("ma200_penalty_full_pct", 10.0)),
         ma200_max_penalty=float(opp_raw.get("ma200_max_penalty", 0.50)),
-
         tranche2_limit=tranche2_limit,
     )
 
-    return EngineConfig(
-        tracked_symbols=tracked_symbols,
-        ignored_symbols=ignored_symbols,
-        dca=dca,
-        opportunistic=opportunistic,
-    )
+    # -------- BTC (optional, opportunistic only)
+    btc_cfg: Optional[BtcOpportunisticConfig] = None
+    btc_raw = raw.get("btc")
+    if btc_symbol and btc_raw:
+        btc_opp_raw = (btc_raw.get("opportunistic") or {})
+        btc_tr2_raw = btc_opp_raw.get("tranche2") or {}
+        btc_tr2 = BtcTranche2Config(
+            enabled=bool(btc_tr2_raw.get("enabled", True)),
+            drawdown_unlock_threshold_pct=float(btc_tr2_raw.get("drawdown_unlock_threshold_pct", -35.0)),
+            ma200_multiplier=float(btc_tr2_raw.get("ma200_multiplier", 1.05)),
+            tif=str(btc_tr2_raw.get("tif", "GTD")).upper(),
+            gtd_end_of_month_utc_hour=int(btc_tr2_raw.get("gtd_end_of_month_utc_hour", 20)),
+            gtd_end_of_month_utc_minute=int(btc_tr2_raw.get("gtd_end_of_month_utc_minute", 0)),
+        )
+        btc_cfg = BtcOpportunisticConfig(
+            monthly_budget_usd=float(btc_raw.get("monthly_budget_usd", 0.0)),
+            drawdown_entry_threshold_pct=float(btc_opp_raw.get("drawdown_entry_threshold_pct", -25.0)),
+            buy_pct_at_entry=float(btc_opp_raw.get("buy_pct_at_entry", 0.25)),
+            drawdown_full_allocation_pct=float(btc_opp_raw.get("drawdown_full_allocation_pct", -45.0)),
+            per_monthly_cap_usd=float(btc_opp_raw.get("per_monthly_cap_usd", btc_raw.get("monthly_budget_usd", 0.0))),
+            ma200_penalty_start_pct=float(btc_opp_raw.get("ma200_penalty_start_pct", 0.0)),
+            ma200_penalty_full_pct=float(btc_opp_raw.get("ma200_penalty_full_pct", 15.0)),
+            ma200_max_penalty=float(btc_opp_raw.get("ma200_max_penalty", 0.50)),
+            tranche2=btc_tr2,
+        )
+
+    return EngineConfig(symbols=symbols_cfg, dca=dca, opportunistic=opportunistic, btc=btc_cfg)
 
 
 # ----------------------------- core math ----------------------------- #
@@ -214,16 +345,17 @@ def compute_drawdown_intensity(
     full_allocation_pct: float,
 ) -> float:
     """
-    Map drawdown to a [0..1] intensity.
+    Map drawdown to a [0..1] intensity (CONTINUOUS, NOT BINARY).
+
+    RATIONALE:
+      - Drawdowns are noisy and can revert quickly.
+      - A linear intensity reduces regret and avoids all-in timing decisions.
+      - We prefer robust behavior over "smart" switches.
 
     - If drawdown is above entry threshold (e.g. -10%), intensity = 0 (not eligible).
     - At entry threshold (e.g. -15%), intensity = buy_pct_at_entry (e.g. 0.30).
     - At full allocation drawdown (e.g. -25%), intensity = 1.0
     - Linearly interpolated between entry and full.
-
-    Note:
-      drawdown_12m_close_pct is negative (e.g. -18.5).
-      entry_threshold_pct and full_allocation_pct are negative too.
     """
     if math.isnan(drawdown_12m_close_pct):
         return 0.0
@@ -235,7 +367,7 @@ def compute_drawdown_intensity(
     # Guard against bad config
     if full_allocation_pct >= entry_threshold_pct:
         # e.g. -20 >= -15 is wrong
-        return buy_pct_at_entry
+        return clamp(buy_pct_at_entry, 0.0, 1.0)
 
     # Progress in [0..1] where 0 at entry_threshold and 1 at full_allocation
     progress = (entry_threshold_pct - drawdown_12m_close_pct) / (entry_threshold_pct - full_allocation_pct)
@@ -254,30 +386,35 @@ def compute_ma200_pacing_multiplier(
     """
     Convert distance to MA200 into a pacing multiplier in (0..1].
 
+    IMPORTANT:
+      - MA200 is NOT an entry signal.
+      - It is ONLY a pacing / throttling mechanism.
+      - Reason: strong assets can stay above MA200 for months; we want slower exposure, not zero.
+
     - If price is at/below penalty_start_pct (often 0%), multiplier = 1.0 (no slowdown).
     - If price is above, linearly reduce to (1 - max_penalty) at penalty_full_pct (e.g. +10%).
     - Never reduces below (1 - max_penalty).
-
-    Important: This is NOT a trigger; it only throttles buys when price is "too far" above MA200.
     """
     if math.isnan(price_vs_ma200_pct):
         return 1.0
+
+    max_pen = clamp(max_penalty, 0.0, 0.95)
 
     if price_vs_ma200_pct <= penalty_start_pct:
         return 1.0
 
     if penalty_full_pct <= penalty_start_pct:
-        return 1.0 - clamp(max_penalty, 0.0, 0.95)
+        return 1.0 - max_pen
 
     if price_vs_ma200_pct >= penalty_full_pct:
-        return 1.0 - clamp(max_penalty, 0.0, 0.95)
+        return 1.0 - max_pen
 
     frac = (price_vs_ma200_pct - penalty_start_pct) / (penalty_full_pct - penalty_start_pct)
-    penalty = clamp(max_penalty, 0.0, 0.95) * frac
+    penalty = max_pen * clamp(frac, 0.0, 1.0)
     return clamp(1.0 - penalty, 0.05, 1.0)
 
 
-# ----------------------------- decision engine ----------------------------- #
+# ----------------------------- snapshot accessors ----------------------------- #
 
 def load_snapshot(snapshot_path: Path) -> Dict[str, Any]:
     return json.loads(snapshot_path.read_text(encoding="utf-8"))
@@ -290,29 +427,170 @@ def get_portfolio_weight_pct(snapshot: Dict[str, Any], symbol: str) -> float:
 
 def get_available_cash_usd(snapshot: Dict[str, Any]) -> float:
     acct = snapshot.get("portfolio", {}).get("account_summary", {})
-    # TotalCashValue_USD exists in your snapshots and is the most direct value.
     return safe_float(acct.get("TotalCashValue_USD"), default=float("nan"))
-
-
-def get_largest_holding_symbol(snapshot: Dict[str, Any]) -> Optional[str]:
-    return snapshot.get("portfolio", {}).get("derived", {}).get("largest_holding_stock_symbol")
 
 
 def get_symbol_core(snapshot: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     return snapshot.get("symbols", {}).get(symbol, {}).get("core_metrics", {}) or {}
 
 
+# ---------------- BTC metrics fallback (self-contained, with rollback) ----------------
+
+def _extract_close_series_from_yf_df(df) -> List[float]:
+    """Extract close prices from yfinance.download() output.
+
+    Supports both simple columns and MultiIndex columns like:
+      MultiIndex([('Close','BTC-USD'), ...], names=['Price','Ticker'])
+    """
+    if df is None or getattr(df, "empty", False):
+        return []
+    cols = df.columns
+    # simple case
+    try:
+        if "Close" in cols:
+            s = df["Close"].dropna()
+            return [float(x) for x in s.tolist()]
+    except Exception:
+        pass
+
+    # MultiIndex case
+    try:
+        import pandas as pd
+        if isinstance(cols, pd.MultiIndex):
+            # Prefer any column where any level equals 'Close'
+            for lvl in range(cols.nlevels):
+                if "Close" in cols.get_level_values(lvl):
+                    close_cols = [c for c in cols if c[lvl] == "Close"]
+                    if close_cols:
+                        s = df[close_cols[0]].dropna()
+                        return [float(x) for x in s.tolist()]
+    except Exception:
+        pass
+    return []
+
+
+def _compute_core_metrics_from_closes(closes: List[float]) -> Dict[str, Any]:
+    """Compute core metrics with the SAME semantics as your snapshot generator.
+    - 12M metrics require >=252 trading days
+    - MA200 requires >=200 trading days
+    """
+    if not closes:
+        return {
+            "last_close": None,
+            "high_12m_close": None,
+            "drawdown_12m_close_pct": None,
+            "ma200_close": None,
+            "price_vs_ma200_pct": None,
+            "below_ma200": None,
+        }
+
+    last_close = float(closes[-1])
+
+    if len(closes) < 252:
+        high_12m = None
+        dd12m = None
+    else:
+        high_12m = float(max(closes[-252:]))
+        dd12m = (last_close / high_12m - 1.0) * 100.0
+
+    if len(closes) < 200:
+        ma200 = None
+        pvma = None
+        below = None
+    else:
+        ma200 = float(sum(closes[-200:]) / 200.0)
+        pvma = (last_close / ma200 - 1.0) * 100.0
+        below = last_close < ma200
+
+    return {
+        "last_close": last_close,
+        "high_12m_close": high_12m,
+        "drawdown_12m_close_pct": dd12m,
+        "ma200_close": ma200,
+        "price_vs_ma200_pct": pvma,
+        "below_ma200": below,
+    }
+
+
+def _has_required_core_metrics(core: Dict[str, Any]) -> bool:
+    """True if DD12M and MA200 metrics are present (non-None)."""
+    if not core:
+        return False
+    return (
+        core.get("drawdown_12m_close_pct") is not None
+        and core.get("price_vs_ma200_pct") is not None
+        and core.get("high_12m_close") is not None
+        and core.get("ma200_close") is not None
+    )
+
+
+def _get_yf_core_metrics(ticker: str) -> Optional[Dict[str, Any]]:
+    """Fetch 5y daily history via yfinance and compute core metrics."""
+    try:
+        df = yf.download(
+            ticker,
+            period="5y",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        closes = _extract_close_series_from_yf_df(df)
+        core = _compute_core_metrics_from_closes(closes)
+        return core if _has_required_core_metrics(core) else None
+    except Exception:
+        return None
+
+
+def resolve_btc_core_metrics(cfg: "EngineConfig", snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """Resolve BTC core metrics with automatic rollback.
+
+    Priority:
+      1) snapshot core_metrics for trade symbol, if complete (rollback when IB1T has enough history)
+      2) yfinance IB1T.SW
+      3) yfinance BTC-USD
+      4) snapshot incomplete metrics (last resort, will lead to NaN/skip)
+    """
+    trade_sym = cfg.symbols.btc_symbol
+    snap_core = get_symbol_core(snapshot, trade_sym) if trade_sym else {}
+    if trade_sym and _has_required_core_metrics(snap_core):
+        return snap_core, f"snapshot:{trade_sym}"
+
+    # Fallback sources (metrics only)
+    core = _get_yf_core_metrics("IB1T.SW")
+    if core:
+        return core, "yfinance:IB1T.SW"
+    core = _get_yf_core_metrics("BTC-USD")
+    if core:
+        return core, "yfinance:BTC-USD"
+
+    # nothing usable
+    return snap_core, f"snapshot:{trade_sym}(insufficient_history)"
+
+# ----------------------------------------------------------------------------- 
+
+
+
+# ----------------------------- ACTIONS: DCA ----------------------------- #
+
 def build_dca_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
     """
     Baseline DCA: distribute monthly budget by target weights.
-    Rule: if current portfolio weight >= target weight (with tolerance), block that symbol's DCA.
-    IMPORTANT: blocked amount is NOT redistributed.
+
+    DESIGN CHOICE (IMPORTANT):
+      If a symbol is blocked (already >= target weight),
+      its DCA budget is NOT redistributed to others.
+
+    RATIONALE:
+      - Prevents over-optimization
+      - Accumulates dry powder
+      - Preserves discipline over "always invested" bias
     """
     budget = cfg.dca.monthly_budget_usd
     planned: Dict[str, Any] = {}
     spent = 0.0
 
-    for symbol in cfg.tracked_symbols:
+    for symbol in cfg.symbols.tracked_actions:
         target_pct = safe_float(cfg.dca.target_weights_pct.get(symbol), default=float("nan"))
         planned_amount = budget * (target_pct / 100.0) if not math.isnan(target_pct) else float("nan")
 
@@ -342,47 +620,49 @@ def build_dca_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tuple[Dict[st
     return planned, spent
 
 
+# ----------------------------- ACTIONS: Opportunistic TR1 ----------------------------- #
+
 def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], float, float]:
     """
-    Opportunistic:
+    Opportunistic (ACTIONS):
       1) Eligible symbols: drawdown <= entry_threshold AND not blocked by risk rules.
       2) Monthly budget is split equally across eligible symbols (N_actives).
       3) Per symbol, buy intensity is:
            intensity(drawdown) * pacing_multiplier(price_vs_ma200)
       4) Per-symbol monthly cap applies.
       5) Leftover remains as cash (not reallocated).
+
+    IMPORTANT ASSUMPTION:
+      Snapshot cash is NOT a hard constraint.
+      Reason: cash can be deposited / converted after this script runs.
+      -> effective_budget == desired_budget (always).
     """
     opp = cfg.opportunistic
 
-    desired_budget = opp.monthly_budget_usd
-    available_cash = get_available_cash_usd(snapshot)
-    if (not opp.allow_exceed_available_cash) and (not math.isnan(available_cash)):
-        effective_budget = min(desired_budget, available_cash)
-    else:
-        effective_budget = desired_budget
-    effective_budget = max(0.0, float(effective_budget))
+    desired_budget = float(opp.monthly_budget_usd)
+    effective_budget = max(0.0, desired_budget)
 
-    largest = get_largest_holding_symbol(snapshot)
     weights = snapshot.get("portfolio", {}).get("derived", {}).get("tracked_weights_pct", {})
 
     eligible: List[str] = []
     blocked_reasons: Dict[str, List[str]] = {}
 
-    for symbol in cfg.tracked_symbols:
+    for symbol in cfg.symbols.tracked_actions:
         reasons: List[str] = []
 
+        # Risk lock: max position weight cap
         current_weight = safe_float(weights.get(symbol), default=float("nan"))
         max_allowed_weight = opp.max_position_weight_pct_overrides.get(symbol.upper(), opp.max_position_weight_pct_default)
         if not math.isnan(current_weight) and current_weight >= max_allowed_weight:
             reasons.append(f"position_cap: current_weight_pct {current_weight:.2f} >= max_allowed_weight_pct {max_allowed_weight:.2f}")
 
-        if opp.forbid_nvda_when_largest_holding and symbol.upper() == "NVDA" and (largest or "").upper() == "NVDA":
-            reasons.append("NVDA_blocked: NVDA is currently the largest holding")
-
+        # Eligibility: drawdown threshold
         core = get_symbol_core(snapshot, symbol)
         drawdown = safe_float(core.get("drawdown_12m_close_pct"), default=float("nan"))
         if math.isnan(drawdown) or drawdown > opp.drawdown_entry_threshold_pct:
-            reasons.append(f"not_eligible: drawdown_12m_close_pct {drawdown if not math.isnan(drawdown) else 'NaN'} > entry_threshold {opp.drawdown_entry_threshold_pct}")
+            reasons.append(
+                f"not_eligible: drawdown_12m_close_pct {drawdown if not math.isnan(drawdown) else 'NaN'} > entry_threshold {opp.drawdown_entry_threshold_pct}"
+            )
 
         if reasons:
             blocked_reasons[symbol] = reasons
@@ -393,7 +673,7 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
     spent = 0.0
 
     if not eligible or effective_budget <= 0:
-        for symbol in cfg.tracked_symbols:
+        for symbol in cfg.symbols.tracked_actions:
             plan[symbol] = {
                 "eligible": False,
                 "base_budget_usd": 0.0,
@@ -407,7 +687,7 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
 
     base_budget = effective_budget / len(eligible)
 
-    for symbol in cfg.tracked_symbols:
+    for symbol in cfg.symbols.tracked_actions:
         core = get_symbol_core(snapshot, symbol)
         drawdown = safe_float(core.get("drawdown_12m_close_pct"), default=float("nan"))
         price_vs_ma200 = safe_float(core.get("price_vs_ma200_pct"), default=float("nan"))
@@ -467,20 +747,25 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
     return plan, spent, effective_budget
 
 
-def build_tranche2_limit_orders(
+# ----------------------------- ACTIONS: TR2 limit orders ----------------------------- #
+
+def build_tranche2_limit_orders_actions(
     cfg: EngineConfig,
     snapshot: Dict[str, Any],
     opp_plan: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
-    TRANCHE 2 design (your chosen variant):
-      - TR1 is bought "now" (from opp_plan capped_amount_usd).
-      - TR2 is a LIMIT order only.
-      - TR2 should only trigger if BOTH are true:
+    TRANCHE 2 DESIGN ("statefulness without state"):
+
+      We do NOT store state between runs.
+      Instead, we encode future conditions into a LIMIT price.
+
+      TR2 should only trigger if BOTH are true:
           (a) drawdown_12m_close_pct <= unlock_threshold (e.g. -20%)
           (b) price <= ma200_close * multiplier(symbol)
-        We encode (a)&(b) as a single limit price:
+      We encode (a)&(b) as a single limit price:
           limit_price = min(high_12m_close*(1+unlock/100), ma200_close*multiplier)
+
     Amount:
       - remaining per-symbol budget = base_budget - tranche1_amount
       - capped by per_symbol_monthly_cap_usd
@@ -495,32 +780,20 @@ def build_tranche2_limit_orders(
     warnings: List[str] = []
     orders: List[Dict[str, Any]] = []
 
-    # Determine base_budget from any eligible symbol (present in plan), else 0
-    eligible_symbols = [s for s in cfg.tracked_symbols if opp_plan.get(s, {}).get("eligible")]
+    eligible_symbols = [s for s in cfg.symbols.tracked_actions if opp_plan.get(s, {}).get("eligible")]
     base_budget = safe_float(opp_plan[eligible_symbols[0]].get("base_budget_usd"), default=0.0) if eligible_symbols else 0.0
 
-    # TIF formatting for reporting
-    if tr2.tif == "GTD":
-        # end of month UTC time
-        # NOTE: we intentionally keep this simple and only for output.
-        # Your order sender can convert it to IBKR's GTD format.
-        from datetime import timedelta  # local import to keep header clean
-        gtd_until_utc = compute_gtd_end_of_month_utc(tr2.gtd_end_of_month_utc_hour, tr2.gtd_end_of_month_utc_minute)
-    else:
-        gtd_until_utc = None
+    gtd_until_utc = compute_gtd_end_of_month_utc(tr2.gtd_end_of_month_utc_hour, tr2.gtd_end_of_month_utc_minute) if tr2.tif == "GTD" else None
 
-    for symbol in cfg.tracked_symbols:
+    for symbol in cfg.symbols.tracked_actions:
         rec = opp_plan.get(symbol, {})
         tranche1_amount = safe_float(rec.get("capped_amount_usd"), default=0.0)
 
-        # Only generate TR2 if TR1 is actually planned to buy now (>0)
         if tranche1_amount <= 0.0:
             continue
 
-        # Remaining budget for this symbol (by construction base_budget is per eligible symbol)
         remaining = max(0.0, base_budget - tranche1_amount)
         tranche2_amount = min(remaining, opp.per_symbol_monthly_cap_usd)
-
         tranche2_amount = round_money(tranche2_amount)
         if tranche2_amount <= 0.0:
             continue
@@ -536,29 +809,12 @@ def build_tranche2_limit_orders(
             )
             continue
 
-        # (a) drawdown unlock threshold price
-        unlock_dd = tr2.drawdown_unlock_threshold_pct  # e.g. -20
-        price_dd_unlock = high_12m_close * (1.0 + unlock_dd / 100.0)  # -20 => *0.80
-
-        # (b) ma200 threshold price
+        unlock_dd = tr2.drawdown_unlock_threshold_pct
+        price_dd_unlock = high_12m_close * (1.0 + unlock_dd / 100.0)
         mult = tr2.ma200_threshold_multipliers.get(symbol.upper(), 1.0)
         price_ma2 = ma200_close * mult
 
-        # Encode (a)&(b) by taking the stricter (lower) price
-        limit_price = min(price_dd_unlock, price_ma2)
-        limit_price = round_money(limit_price)
-
-        rationale = {
-            "unlock_rule": f"DD12M <= {unlock_dd:.2f}% AND price <= MA200*multiplier",
-            "computed": {
-                "high_12m_close": round_money(high_12m_close),
-                "ma200_close": round_money(ma200_close),
-                "ma200_multiplier": mult,
-                "price_dd_unlock": round_money(price_dd_unlock),
-                "price_ma200_threshold": round_money(price_ma2),
-                "limit_price": limit_price,
-            }
-        }
+        limit_price = round_money(min(price_dd_unlock, price_ma2))
 
         orders.append({
             "symbol": symbol,
@@ -569,10 +825,179 @@ def build_tranche2_limit_orders(
             "tif": tr2.tif,
             "gtd_until_utc": gtd_until_utc,
             "tag": f"OPP_TR2_{month_key_utc()}",
-            "rationale": rationale,
+            "rationale": {
+                "unlock_rule": f"DD12M <= {unlock_dd:.2f}% AND price <= MA200*multiplier",
+                "computed": {
+                    "high_12m_close": round_money(high_12m_close),
+                    "ma200_close": round_money(ma200_close),
+                    "ma200_multiplier": mult,
+                    "price_dd_unlock": round_money(price_dd_unlock),
+                    "price_ma200_threshold": round_money(price_ma2),
+                    "limit_price": limit_price,
+                }
+            },
         })
 
     return orders, warnings
+
+
+# ----------------------------- BTC: Opportunistic only ----------------------------- #
+
+def build_btc_opportunistic_plan(
+    cfg: EngineConfig,
+    snapshot: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], float, float]:
+    """
+    BTC is a satellite. We run a single-instrument opportunistic plan (TR1 now + TR2 limit).
+
+    IMPORTANT:
+      - No DCA for BTC in this engine (explicitly disabled by design).
+      - BTC is NOT constrained by the actions position weight caps here.
+      - Snapshot cash is NOT a hard constraint.
+    """
+    if not cfg.btc or not cfg.symbols.btc_symbol:
+        return None, 0.0, 0.0
+
+    btc = cfg.btc
+    sym = cfg.symbols.btc_symbol
+
+    desired_budget = float(btc.monthly_budget_usd)
+    effective_budget = max(0.0, desired_budget)
+    core, metrics_source = resolve_btc_core_metrics(cfg, snapshot)
+    if not core:
+        # Missing from snapshot -> disable but report
+        return {
+            "symbol": sym, "metrics_source": metrics_source,
+            "enabled": True,
+            "error": f"BTC symbol '{sym}' not found in snapshot['symbols']",
+        }, 0.0, effective_budget
+
+    drawdown = safe_float(core.get("drawdown_12m_close_pct"), default=float("nan"))
+    price_vs_ma200 = safe_float(core.get("price_vs_ma200_pct"), default=float("nan"))
+
+    # Eligibility: drawdown threshold
+    if math.isnan(drawdown) or drawdown > btc.drawdown_entry_threshold_pct:
+        plan = {
+            "symbol": sym,
+            "eligible": False,
+            "drawdown_12m_close_pct": drawdown,
+            "price_vs_ma200_pct": price_vs_ma200,
+            "base_budget_usd": round_money(effective_budget),
+            "drawdown_intensity": 0.0,
+            "ma200_pacing_multiplier": 1.0,
+            "raw_amount_usd": 0.0,
+            "tr1_amount_usd": 0.0,
+            "blocked_reasons": [
+                f"not_eligible: drawdown_12m_close_pct {drawdown if not math.isnan(drawdown) else 'NaN'} > entry_threshold {btc.drawdown_entry_threshold_pct}"
+            ],
+        }
+        return plan, 0.0, effective_budget
+
+    drawdown_intensity = compute_drawdown_intensity(
+        drawdown_12m_close_pct=drawdown,
+        entry_threshold_pct=btc.drawdown_entry_threshold_pct,
+        buy_pct_at_entry=btc.buy_pct_at_entry,
+        full_allocation_pct=btc.drawdown_full_allocation_pct,
+    )
+
+    ma200_multiplier = compute_ma200_pacing_multiplier(
+        price_vs_ma200_pct=price_vs_ma200,
+        penalty_start_pct=btc.ma200_penalty_start_pct,
+        penalty_full_pct=btc.ma200_penalty_full_pct,
+        max_penalty=btc.ma200_max_penalty,
+    )
+
+    raw_amount = effective_budget * drawdown_intensity * ma200_multiplier
+    tr1_amount = min(raw_amount, btc.per_monthly_cap_usd)
+
+    plan = {
+        "symbol": sym,
+        "eligible": True,
+        "drawdown_12m_close_pct": drawdown,
+        "price_vs_ma200_pct": price_vs_ma200,
+        "base_budget_usd": round_money(effective_budget),
+        "drawdown_intensity": round(drawdown_intensity, 4),
+        "ma200_pacing_multiplier": round(ma200_multiplier, 4),
+        "raw_amount_usd": round_money(raw_amount),
+        "tr1_amount_usd": round_money(tr1_amount),
+        "blocked_reasons": [],
+    }
+    return plan, round_money(tr1_amount), round_money(effective_budget)
+
+
+def build_tranche2_limit_order_btc(
+    cfg: EngineConfig,
+    snapshot: Dict[str, Any],
+    btc_plan: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    BTC TR2: LIMIT order that encodes:
+      (DD12M <= unlock_threshold) AND (price <= MA200 * multiplier)
+
+    limit_price = min(high_12m_close*(1+unlock/100), ma200_close*multiplier)
+
+    Amount:
+      remaining = base_budget - tr1_amount
+      capped by per_monthly_cap_usd
+    """
+    if not cfg.btc or not cfg.symbols.btc_symbol or not btc_plan:
+        return None, None
+
+    btc = cfg.btc
+    tr2 = btc.tranche2
+    sym = cfg.symbols.btc_symbol
+    
+    core, metrics_source = resolve_btc_core_metrics(cfg, snapshot)
+
+    if not tr2.enabled:
+        return None, None
+
+    tr1_amount = safe_float(btc_plan.get("tr1_amount_usd"), default=0.0)
+    base_budget = safe_float(btc_plan.get("base_budget_usd"), default=0.0)
+    if tr1_amount <= 0.0 or base_budget <= 0.0:
+        return None, None
+
+    remaining = max(0.0, base_budget - tr1_amount)
+    tr2_amount = min(remaining, btc.per_monthly_cap_usd)
+    tr2_amount = round_money(tr2_amount)
+    if tr2_amount <= 0.0:
+        return None, None
+    high_12m_close = safe_float(core.get("high_12m_close"), default=float("nan"))
+    ma200_close = safe_float(core.get("ma200_close"), default=float("nan"))
+
+    if math.isnan(high_12m_close) or math.isnan(ma200_close):
+        return None, f"{sym}: cannot compute BTC TR2 limit (need high_12m_close and ma200_close)"
+
+    unlock_dd = tr2.drawdown_unlock_threshold_pct
+    price_dd_unlock = high_12m_close * (1.0 + unlock_dd / 100.0)
+    price_ma2 = ma200_close * float(tr2.ma200_multiplier)
+
+    limit_price = round_money(min(price_dd_unlock, price_ma2))
+    gtd_until_utc = compute_gtd_end_of_month_utc(tr2.gtd_end_of_month_utc_hour, tr2.gtd_end_of_month_utc_minute) if tr2.tif == "GTD" else None
+
+    order = {
+        "symbol": sym,
+        "metrics_source": metrics_source,
+        "side": "BUY",
+        "order_type": "LMT",
+        "amount_usd": tr2_amount,
+        "limit_price": limit_price,
+        "tif": tr2.tif,
+        "gtd_until_utc": gtd_until_utc,
+        "tag": f"BTC_TR2_{month_key_utc()}",
+        "rationale": {
+            "unlock_rule": f"DD12M <= {unlock_dd:.2f}% AND price <= MA200*{float(tr2.ma200_multiplier):.4f}",
+            "computed": {
+                "high_12m_close": round_money(high_12m_close),
+                "ma200_close": round_money(ma200_close),
+                "ma200_multiplier": float(tr2.ma200_multiplier),
+                "price_dd_unlock": round_money(price_dd_unlock),
+                "price_ma200_threshold": round_money(price_ma2),
+                "limit_price": limit_price,
+            }
+        },
+    }
+    return order, None
 
 
 # ----------------------------- reporting ----------------------------- #
@@ -585,21 +1010,21 @@ def format_table_row(cols: List[str], widths: List[int]) -> str:
     return " | ".join(padded)
 
 
-def print_opportunistic_walkthrough(cfg: EngineConfig, snapshot: Dict[str, Any], opp_plan: Dict[str, Any], totals: Dict[str, float]) -> None:
+def print_opportunistic_walkthrough_actions(cfg: EngineConfig, snapshot: Dict[str, Any], opp_plan: Dict[str, Any], totals: Dict[str, float]) -> None:
     opp = cfg.opportunistic
-    print("Opportunistic Decision Walkthrough:")
+    print("Opportunistic Decision Walkthrough (ACTIONS):")
     print(f"  Opportunistic budget (desired): {opp.monthly_budget_usd:.2f} USD")
-    if not math.isnan(totals.get("available_cash_usd", float("nan"))):
-        print(f"  Available cash (USD): {totals['available_cash_usd']:.2f} USD")
+    if not math.isnan(totals.get('available_cash_usd', float('nan'))):
+        print(f"  Available cash (snapshot, informational): {totals['available_cash_usd']:.2f} USD")
     print(f"  Effective budget used for split: {totals['opp_effective_budget_usd']:.2f} USD")
     print("")
     print("  Eligibility rule:")
     print(f"    - drawdown_12m_close_pct <= {opp.drawdown_entry_threshold_pct:.2f}%")
-    print("    - and not blocked by risk locks (max weight cap, NVDA lock if enabled)")
+    print("    - and not blocked by risk locks (max position weight cap)")
     print("")
 
-    eligible = [s for s in cfg.tracked_symbols if opp_plan.get(s, {}).get("eligible")]
-    blocked = [s for s in cfg.tracked_symbols if s not in eligible]
+    eligible = [s for s in cfg.symbols.tracked_actions if opp_plan.get(s, {}).get("eligible")]
+    blocked = [s for s in cfg.symbols.tracked_actions if s not in eligible]
 
     if not eligible:
         print("  Result: no eligible symbols this month → opportunistic allocation is 0 for all symbols.")
@@ -645,14 +1070,13 @@ def print_opportunistic_walkthrough(cfg: EngineConfig, snapshot: Dict[str, Any],
         else:
             print(f"    Linear drawdown intensity mapping: intensity = {intensity:.4f} (config guard / NaN)")
 
-        print(f"    raw_amount = base_budget * intensity * ma200_multiplier")
+        print("    raw_amount = base_budget * intensity * ma200_multiplier")
         print(f"              ≈ {base_budget:.2f} * {intensity:.4f} * {mult:.4f} = {raw_amt:.2f} USD")
 
         if capped_amt < raw_amt:
             print(f"    per_symbol_monthly_cap_usd = {cap:.2f} → capped to {capped_amt:.2f} USD")
         else:
             print(f"    per_symbol_monthly_cap_usd = {cap:.2f} → no cap applied ({capped_amt:.2f} USD)")
-
         print("")
 
     if blocked:
@@ -673,8 +1097,64 @@ def print_opportunistic_walkthrough(cfg: EngineConfig, snapshot: Dict[str, Any],
     print("")
 
 
-def print_tranche2_orders(orders: List[Dict[str, Any]], warnings: List[str]) -> None:
-    print("Opportunistic Tranche-2 LIMIT Orders (stateful without saving state):")
+def print_btc_section(btc_plan: Optional[Dict[str, Any]], btc_tr2_order: Optional[Dict[str, Any]], btc_warn: Optional[str]) -> None:
+    print("BTC Opportunistic (SATELLITE):")
+    if not btc_plan:
+        print("  BTC disabled (no symbols.btc.symbol or no btc section in config).")
+        print("")
+        return
+
+    if "error" in btc_plan:
+        print(f"  ERROR: {btc_plan['error']}")
+        print("")
+        return
+
+    sym = btc_plan.get("symbol", "BTC")
+    eligible = btc_plan.get("eligible", False)
+
+    if not eligible:
+        dd = btc_plan.get("drawdown_12m_close_pct")
+        pv = btc_plan.get("price_vs_ma200_pct")
+        reasons = btc_plan.get("blocked_reasons", [])
+        print(f"  {sym}: NOT eligible this run.")
+        print(f"    drawdown_12m_close_pct = {dd}")
+        print(f"    price_vs_ma200_pct = {pv}")
+        if reasons:
+            print("    reasons: " + "; ".join(reasons))
+        print("")
+        return
+
+    dd = btc_plan.get("drawdown_12m_close_pct")
+    pv = btc_plan.get("price_vs_ma200_pct")
+    base = btc_plan.get("base_budget_usd")
+    tr1 = btc_plan.get("tr1_amount_usd")
+    intensity = btc_plan.get("drawdown_intensity")
+    mult = btc_plan.get("ma200_pacing_multiplier")
+
+    print(f"  {sym}: eligible")
+    print(f"    base_budget_usd = {base}")
+    print(f"    drawdown_12m_close_pct = {dd}")
+    print(f"    price_vs_ma200_pct = {pv}")
+    print(f"    TR1 amount (buy now) = {tr1} USD  (intensity={intensity}, ma200_multiplier={mult})")
+
+    if btc_tr2_order:
+        lp = btc_tr2_order["limit_price"]
+        amt = btc_tr2_order["amount_usd"]
+        tif = btc_tr2_order["tif"]
+        gtd = btc_tr2_order.get("gtd_until_utc")
+        comp = btc_tr2_order["rationale"]["computed"]
+        print(f"    TR2 LIMIT: BUY {amt:.2f} USD @ {lp:.2f}  TIF={tif}" + (f"  GTD_until_utc={gtd}" if gtd else ""))
+        print(f"      limit_price = min(price_dd_unlock={comp['price_dd_unlock']:.2f}, price_ma200_threshold={comp['price_ma200_threshold']:.2f})")
+    else:
+        print("    TR2 LIMIT: none generated this run.")
+
+    if btc_warn:
+        print(f"    WARNING: {btc_warn}")
+    print("")
+
+
+def print_tranche2_orders_actions(orders: List[Dict[str, Any]], warnings: List[str]) -> None:
+    print("Opportunistic Tranche-2 LIMIT Orders (ACTIONS):")
     if warnings:
         for w in warnings:
             print(f"  WARNING: {w}")
@@ -704,8 +1184,11 @@ def print_report(
     dca_plan: Dict[str, Any],
     opp_plan: Dict[str, Any],
     totals: Dict[str, float],
-    tranche2_orders: List[Dict[str, Any]],
-    tranche2_warnings: List[str],
+    tranche2_orders_actions: List[Dict[str, Any]],
+    tranche2_warnings_actions: List[str],
+    btc_plan: Optional[Dict[str, Any]],
+    btc_tr2_order: Optional[Dict[str, Any]],
+    btc_warn: Optional[str],
 ) -> None:
     print("")
     print("=== Monthly Engine Report ===")
@@ -716,11 +1199,11 @@ def print_report(
     print("")
 
     headers = ["SYMBOL", "WGT%", "DD12M%", "Px-vs-MA200%", "DCA_USD", "OPP_TR1_USD", "TOTAL_USD", "NOTES"]
-    widths = [6, 7, 7, 12, 8, 11, 9, 40]
+    widths = [6, 7, 7, 12, 8, 11, 9, 48]
     print(format_table_row(headers, widths))
     print("-" * (sum(widths) + 3 * (len(widths) - 1)))
 
-    for symbol in cfg.tracked_symbols:
+    for symbol in cfg.symbols.tracked_actions:
         wgt = safe_float(dca_plan[symbol]["current_weight_pct"])
         dd = safe_float(opp_plan[symbol].get("drawdown_12m_close_pct", float("nan")))
         pv = safe_float(opp_plan[symbol].get("price_vs_ma200_pct", float("nan")))
@@ -747,30 +1230,28 @@ def print_report(
         print(format_table_row(row, widths))
 
     print("")
-    print("Totals:")
-    print(f"  DCA spent:           {totals['dca_spent_usd']:.2f} USD")
-    print(f"  Opportunistic TR1 spent: {totals['opp_spent_usd']:.2f} USD")
-    print(f"  Combined spent:      {totals['total_spent_usd']:.2f} USD")
+    print("Totals (ACTIONS):")
+    print(f"  DCA spent:              {totals['dca_spent_usd']:.2f} USD")
+    print(f"  Opportunistic TR1 spent:{totals['opp_spent_usd']:.2f} USD")
+    print(f"  Combined spent:         {totals['total_spent_usd']:.2f} USD")
     if not math.isnan(totals.get("available_cash_usd", float("nan"))):
-        print(f"  Available cash (USD): {totals['available_cash_usd']:.2f} USD")
+        print(f"  Available cash (snapshot, informational): {totals['available_cash_usd']:.2f} USD")
     print(f"  Opportunistic effective budget used for split: {totals['opp_effective_budget_usd']:.2f} USD")
     print("")
 
-    print_opportunistic_walkthrough(cfg, snapshot, opp_plan, totals)
-    print_tranche2_orders(tranche2_orders, tranche2_warnings)
+    print_opportunistic_walkthrough_actions(cfg, snapshot, opp_plan, totals)
+    print_tranche2_orders_actions(tranche2_orders_actions, tranche2_warnings_actions)
+    print_btc_section(btc_plan, btc_tr2_order, btc_warn)
 
-    print("Methodology:")
-    print("  1) Baseline DCA: allocate the monthly DCA budget across symbols by target weights.")
+    print("Methodology (summary):")
+    print("  1) Baseline DCA (ACTIONS): allocate monthly DCA budget across symbols by target weights.")
     print("     If a symbol is already at/above its target weight, its DCA is blocked and NOT redistributed.")
-    print("  2) Opportunistic TR1: only symbols with drawdown_12m_close_pct <= entry_threshold are considered.")
-    print("     Eligible symbols share the opportunistic budget equally (N_actives).")
-    print("  3) TR1 intensity is linear with drawdown, paced by MA200 distance (not a binary trigger).")
-    print("  4) Opportunistic TR2 (LIMIT): generated only when TR1 amount > 0.")
-    print("     It encodes: DD12M <= unlock_threshold AND price <= MA200*multiplier as a single limit price:")
-    print("       limit_price = min(high_12m_close*(1+unlock/100), ma200_close*multiplier)")
-    print("     This adds statefulness without saving state files.")
-    print("  5) Risk locks: max weight cap (default + per-symbol overrides) and NVDA blocked when largest holding (optional).")
-    print("  6) Any leftover budget remains cash (no forced redistribution).")
+    print("  2) Opportunistic TR1 (ACTIONS/BTC): eligible when drawdown_12m_close_pct <= entry_threshold.")
+    print("     - Continuous linear intensity with drawdown (no binary triggers).")
+    print("     - MA200 is pacing only (throttle), not a timing signal.")
+    print("  3) Opportunistic TR2 (LIMIT): generated only when TR1 amount > 0.")
+    print("     Encodes: DD12M <= unlock_threshold AND price <= MA200*multiplier as limit_price = min(dd_price, ma200_price).")
+    print("  4) Snapshot cash is informational only; budgets are not cash-capped here.")
     print("")
 
 
@@ -803,10 +1284,14 @@ def main() -> int:
 
     snapshot = load_snapshot(snapshot_path)
 
+    # ----- actions
     dca_plan, dca_spent = build_dca_plan(cfg, snapshot)
     opp_plan, opp_spent, opp_effective_budget = build_opportunistic_plan(cfg, snapshot)
+    tr2_orders_actions, tr2_warnings_actions = build_tranche2_limit_orders_actions(cfg, snapshot, opp_plan)
 
-    tranche2_orders, tranche2_warnings = build_tranche2_limit_orders(cfg, snapshot, opp_plan)
+    # ----- BTC (optional)
+    btc_plan, btc_tr1_spent, btc_effective_budget = build_btc_opportunistic_plan(cfg, snapshot)
+    btc_tr2_order, btc_warn = build_tranche2_limit_order_btc(cfg, snapshot, btc_plan)
 
     totals = {
         "dca_spent_usd": round_money(dca_spent),
@@ -816,7 +1301,19 @@ def main() -> int:
         "opp_effective_budget_usd": round_money(opp_effective_budget),
     }
 
-    print_report(cfg, snapshot_path, snapshot, dca_plan, opp_plan, totals, tranche2_orders, tranche2_warnings)
+    print_report(
+        cfg=cfg,
+        snapshot_path=snapshot_path,
+        snapshot=snapshot,
+        dca_plan=dca_plan,
+        opp_plan=opp_plan,
+        totals=totals,
+        tranche2_orders_actions=tr2_orders_actions,
+        tranche2_warnings_actions=tr2_warnings_actions,
+        btc_plan=btc_plan,
+        btc_tr2_order=btc_tr2_order,
+        btc_warn=btc_warn,
+    )
 
     payload = {
         "meta": {
@@ -826,18 +1323,30 @@ def main() -> int:
             "snapshot_path": str(snapshot_path),
             "config_path": str(config_path),
         },
-        "dca": dca_plan,
-        "opportunistic": opp_plan,
-        "orders": {
-            "opportunistic_tr1_buy_now": [
-                {"symbol": s, "amount_usd": round_money(safe_float(opp_plan.get(s, {}).get("capped_amount_usd"), 0.0))}
-                for s in cfg.tracked_symbols
-                if safe_float(opp_plan.get(s, {}).get("capped_amount_usd"), 0.0) > 0.0
-            ],
-            "opportunistic_tr2_limit": tranche2_orders,
-            "warnings": tranche2_warnings,
+        "actions": {
+            "tracked_symbols": cfg.symbols.tracked_actions,
+            "dca": dca_plan,
+            "opportunistic_tr1": opp_plan,
+            "orders": {
+                "opportunistic_tr1_buy_now": [
+                    {"symbol": s, "amount_usd": round_money(safe_float(opp_plan.get(s, {}).get("capped_amount_usd"), 0.0))}
+                    for s in cfg.symbols.tracked_actions
+                    if safe_float(opp_plan.get(s, {}).get("capped_amount_usd"), 0.0) > 0.0
+                ],
+                "opportunistic_tr2_limit": tr2_orders_actions,
+                "warnings": tr2_warnings_actions,
+            },
+            "totals": totals,
         },
-        "totals": totals,
+        "btc": {
+            "enabled": bool(cfg.btc and cfg.symbols.btc_symbol),
+            "symbol": cfg.symbols.btc_symbol,
+            "plan": btc_plan,
+            "tr1_spent_usd": btc_tr1_spent,
+            "effective_budget_usd": btc_effective_budget,
+            "tr2_limit_order": btc_tr2_order,
+            "warning": btc_warn,
+        },
     }
 
     if args.output:

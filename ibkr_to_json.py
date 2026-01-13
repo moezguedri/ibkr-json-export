@@ -2,6 +2,12 @@
 """
 IBKR → One JSON snapshot (portfolio + symbols), redesigned.
 
+Debug-enhanced self-contained version:
+- Does NOT read config.json
+- Adds structured logging + per-symbol diagnostics to find failures quickly
+- Always logs the *resolved yfinance ticker* used for each IBKR symbol
+- Captures and stores exceptions (with short traceback) under snapshot['diagnostics']
+
 FULL mode (default):
 - Daily history (5y by default) via yfinance
 - Intraday history: 1h bars over ~6 months (intraday_1h_6m) via yfinance
@@ -13,23 +19,8 @@ LIGHT mode (--light):
 - Daily history shortened (last ~260 bars)
 - NO intraday, NO fundamentals, NO open orders
 
-Stable snapshot contract for downstream consumers:
-- portfolio.derived.tracked_weights_pct
-- portfolio.derived.largest_holding_stock_symbol
-- symbols[SYM].core_metrics:
-    last_close
-    high_12m_close
-    drawdown_12m_close_pct
-    ma200_close
-    price_vs_ma200_pct
-    below_ma200
-
 Machine-friendly output:
 - Prints: SNAPSHOT_PATH=<path>
-
-Where to change things:
-- Defaults are in the USER CONFIGURATION section below.
-- You can override most defaults via CLI flags.
 
 Requirements:
 - Python 3.10+
@@ -41,18 +32,42 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import sys
+import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yfinance as yf
 from ib_insync import IB, Stock
 
 
 # ===================== USER CONFIGURATION ===================== #
-DEFAULT_TRACKED_SYMBOLS = ["NVDA", "MSFT", "AMZN", "META", "GOOGL"]
-DEFAULT_IGNORED_SYMBOLS = ["COST"]
+
+# Symbols you want to track in the snapshot (IBKR symbols, not Yahoo symbols)
+DEFAULT_TRACKED_SYMBOLS = ["NVDA", "MSFT", "AMZN", "META", "GOOGL", "IB1T", "COST"]
+
+# Mapping: IBKR symbol -> Yahoo Finance ticker used by yfinance
+# (This is the fix for your IB1T 404 problem.)
+YF_TICKER_OVERRIDES: Dict[str, str] = {
+    # iShares Bitcoin ETP on SIX (EBS) in CHF uses .SW on Yahoo
+    "IB1T": "IB1T.SW",
+}
+
+# Mapping: IBKR symbol -> contract overrides for IBKR fundamental queries
+# (Only needed for instruments where USD/SMART defaults are wrong.)
+IBKR_CONTRACT_OVERRIDES: Dict[str, Dict[str, str]] = {
+    # Same instrument you showed:
+    # exchange SMART, currency CHF, primaryExchange EBS
+    "IB1T": {"exchange": "SMART", "currency": "CHF", "primaryExchange": "EBS"},
+}
+
+# Defaults for "normal" US stocks
+IBKR_DEFAULT_EXCHANGE = "SMART"
+IBKR_DEFAULT_CURRENCY = "USD"
 
 # IBKR connection defaults (TWS / IB Gateway)
 IB_HOST = "127.0.0.1"
@@ -82,6 +97,11 @@ FETCH_IBKR_FUNDAMENTALS_IN_FULL = True  # can be huge (XML)
 
 # Performance
 YFINANCE_THREADS = True
+
+# yfinance retries
+YF_MAX_RETRIES = 3
+YF_RETRY_BACKOFF_SEC = 1.5
+
 # ============================================================= #
 
 
@@ -108,13 +128,7 @@ def ensure_dir(path: str) -> None:
 
 
 def safe_float(x: Any) -> Optional[float]:
-    """
-    Convert scalars to float safely.
-
-    Fixes pandas FutureWarning: float(Series([single])) is deprecated.
-    - If x looks like a pandas Series (has .iloc), use x.iloc[0].
-    - If x is a numpy scalar, float(x) works.
-    """
+    """Convert scalars to float safely (handles pandas Series singletons)."""
     try:
         if x is None:
             return None
@@ -122,7 +136,6 @@ def safe_float(x: Any) -> Optional[float]:
         # pandas Series or similar
         if hasattr(x, "iloc") and not isinstance(x, (str, bytes)):
             try:
-                # Handle empty series
                 if hasattr(x, "empty") and x.empty:
                     return None
                 return float(x.iloc[0])
@@ -134,11 +147,47 @@ def safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def resolve_yf_ticker(symbol: str) -> str:
+    """Return the yfinance ticker for a tracked IBKR symbol."""
+    s = symbol.upper()
+    return YF_TICKER_OVERRIDES.get(s, s)
+
+
+def resolve_ibkr_contract(symbol: str) -> Tuple[str, str, Optional[str]]:
+    """Return (exchange, currency, primaryExchange) for IBKR contract resolution."""
+    s = symbol.upper()
+    o = IBKR_CONTRACT_OVERRIDES.get(s, {})
+    exchange = o.get("exchange", IBKR_DEFAULT_EXCHANGE)
+    currency = o.get("currency", IBKR_DEFAULT_CURRENCY)
+    primary = o.get("primaryExchange")
+    return exchange, currency, primary
+
+
+def setup_logging(debug: bool) -> logging.Logger:
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stderr,
+    )
+    return logging.getLogger("ibkr_to_json")
+
+
+def short_tb(exc: BaseException, max_lines: int = 10) -> str:
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    lines = tb.strip().splitlines()
+    if len(lines) <= max_lines:
+        return tb
+    return "\n".join(lines[-max_lines:])
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Generate a single IBKR snapshot JSON (portfolio + symbols). FULL by default."
     )
     p.add_argument("--light", action="store_true", help="Generate a LIGHT snapshot (faster, smaller).")
+    p.add_argument("--debug", action="store_true", help="Verbose logging + extra diagnostics.")
     p.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
@@ -147,12 +196,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--symbols",
         default=",".join(DEFAULT_TRACKED_SYMBOLS),
-        help="Comma-separated tracked symbols (default from script).",
-    )
-    p.add_argument(
-        "--ignore",
-        default=",".join(DEFAULT_IGNORED_SYMBOLS),
-        help="Comma-separated ignored symbols (default from script).",
+        help="Comma-separated tracked symbols (IBKR symbols) (default from script).",
     )
     p.add_argument("--host", default=IB_HOST, help="IBKR API host (default from script).")
     p.add_argument("--port", type=int, default=IB_PORT, help="IBKR API port (default from script).")
@@ -203,9 +247,11 @@ def build_mode_config(args: argparse.Namespace) -> ModeConfig:
     )
 
 
-def connect_ib(host: str, port: int, client_id: int) -> IB:
+def connect_ib(host: str, port: int, client_id: int, log: logging.Logger) -> IB:
     ib = IB()
+    log.info(f"Connecting to IBKR API {host}:{port} clientId={client_id} ...")
     ib.connect(host, port, clientId=client_id)
+    log.info("Connected to IBKR.")
     return ib
 
 
@@ -239,7 +285,7 @@ def fetch_portfolio(ib: IB) -> Dict[str, Any]:
 
 
 def derive_tracked(portfolio: Dict[str, Any], tracked_symbols: List[str]) -> Dict[str, Any]:
-    tracked_set = set(tracked_symbols)
+    tracked_set = set(s.upper() for s in tracked_symbols)
     positions_all = portfolio.get("positions_all", [])
 
     tracked_positions = [p for p in positions_all if (p.get("symbol") or "").upper() in tracked_set]
@@ -259,21 +305,12 @@ def derive_tracked(portfolio: Dict[str, Any], tracked_symbols: List[str]) -> Dic
             largest_mv = mv
             largest_symbol = sym
 
-    ignored_positions_detected = sorted(
-        {
-            (p.get("symbol") or "").upper()
-            for p in positions_all
-            if (p.get("symbol") is not None) and ((p.get("symbol") or "").upper() not in tracked_set)
-        }
-    )
-
     return {
         "positions_tracked": tracked_positions,
         "derived": {
             "tracked_total_market_value": safe_float(total_tracked_mv),
             "tracked_weights_pct": tracked_weights_pct,
             "largest_holding_stock_symbol": largest_symbol,
-            "ignored_positions_detected": ignored_positions_detected,
         },
     }
 
@@ -307,38 +344,102 @@ def fetch_open_orders(ib: IB) -> List[Dict[str, Any]]:
     return out
 
 
-def yf_download_daily(symbols: List[str], years: int) -> Dict[str, Any]:
+def yf_download_with_retries(log: logging.Logger, *, tickers: str, **kwargs) -> Any:
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, YF_MAX_RETRIES + 1):
+        try:
+            return yf.download(tickers=tickers, **kwargs)
+        except Exception as e:
+            last_exc = e
+            log.warning(f"yfinance.download failed (attempt {attempt}/{YF_MAX_RETRIES}) tickers={tickers!r}: {e}")
+            if attempt < YF_MAX_RETRIES:
+                time.sleep(YF_RETRY_BACKOFF_SEC * attempt)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("yfinance.download failed with unknown error")
+
+
+def yf_download_daily(
+    log: logging.Logger,
+    tracked_symbols: List[str],
+    years: int,
+    diagnostics: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Download daily OHLCV for all tracked symbols using their yfinance tickers."""
     period = f"{years}y"
-    data = yf.download(
-        tickers=" ".join(symbols),
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        threads=YFINANCE_THREADS,
-        progress=False,
-    )
+
+    # Map tracked -> yf ticker
+    t2y = {sym: resolve_yf_ticker(sym) for sym in tracked_symbols}
+    yf_tickers = list(dict.fromkeys(t2y.values()))  # stable unique
+
+    log.info(f"Daily history: period={period}, symbols={tracked_symbols}")
+    log.info(f"Daily history: yfinance tickers={yf_tickers} (resolved)")
+
+    # Guard: if a known override exists but the raw symbol is passed, log it.
+    for sym in tracked_symbols:
+        yf_sym = t2y[sym]
+        if sym == "IB1T" and yf_sym == "IB1T":
+            log.error("BUG: IB1T was NOT mapped to IB1T.SW. Override missing or bypassed.")
+            diagnostics.setdefault("global_errors", []).append(
+                {"where": "yf_download_daily", "symbol": sym, "error": "IB1T not mapped to IB1T.SW"}
+            )
 
     out: Dict[str, Any] = {}
-    if len(symbols) == 1:
-        out[symbols[0]] = data
+    try:
+        data = yf_download_with_retries(
+            log,
+            tickers=" ".join(yf_tickers),
+            period=period,
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            threads=YFINANCE_THREADS,
+            progress=False,
+        )
+    except Exception as e:
+        diagnostics.setdefault("global_errors", []).append(
+            {"where": "yf_download_daily", "error": str(e), "trace": short_tb(e)}
+        )
+        # Return None for each symbol so the snapshot can still be produced.
+        for sym in tracked_symbols:
+            out[sym] = None
         return out
 
-    for sym in symbols:
+    if len(yf_tickers) == 1:
+        only_yf = yf_tickers[0]
+        for tracked, yf_sym in t2y.items():
+            out[tracked] = data if yf_sym == only_yf else None
+        return out
+
+    # Multiple tickers: grouped by yf symbol (top-level columns)
+    for tracked, yf_sym in t2y.items():
         try:
-            out[sym] = data[sym].dropna(how="all")
-        except Exception:
-            out[sym] = None
+            out[tracked] = data[yf_sym].dropna(how="all")
+        except Exception as e:
+            diagnostics.setdefault("symbol_errors", {}).setdefault(tracked, []).append(
+                {
+                    "where": "yf_download_daily.select_group",
+                    "tracked_symbol": tracked,
+                    "yfinance_ticker": yf_sym,
+                    "error": str(e),
+                }
+            )
+            out[tracked] = None
     return out
 
 
-def yf_download_intraday_1h(symbol: str) -> Any:
-    """
-    yfinance intraday (1h). period=6mo usually supported.
-    """
+def yf_download_intraday_1h(
+    log: logging.Logger,
+    tracked_symbol: str,
+    diagnostics: Dict[str, Any],
+) -> Any:
+    """yfinance intraday (1h). period=6mo usually supported."""
+    yf_symbol = resolve_yf_ticker(tracked_symbol)
+    log.debug(f"Intraday 1h: {tracked_symbol} -> {yf_symbol} period={INTRADAY_PERIOD}")
     try:
-        df = yf.download(
-            tickers=symbol,
+        df = yf_download_with_retries(
+            log,
+            tickers=yf_symbol,
             period=INTRADAY_PERIOD,
             interval=INTRADAY_INTERVAL,
             auto_adjust=False,
@@ -346,21 +447,23 @@ def yf_download_intraday_1h(symbol: str) -> Any:
             threads=False,
         )
         return df.dropna(how="all") if df is not None else None
-    except Exception:
+    except Exception as e:
+        diagnostics.setdefault("symbol_errors", {}).setdefault(tracked_symbol, []).append(
+            {
+                "where": "yf_download_intraday_1h",
+                "tracked_symbol": tracked_symbol,
+                "yfinance_ticker": yf_symbol,
+                "error": str(e),
+                "trace": short_tb(e),
+            }
+        )
         return None
 
 
 def get_row_value(row: Any, field: str) -> Any:
-    """
-    Robustly fetch a value from a pandas Series row.
-    Handles both:
-      - flat columns: "Open", "High", ...
-      - MultiIndex columns: ("Open", "MSFT") etc., where row["Open"] returns a sub-Series.
-    """
+    """Robustly fetch a value from a pandas Series row."""
     try:
-        v = row.get(field)
-        # If v is a Series (single element), safe_float will handle it.
-        return v
+        return row.get(field)
     except Exception:
         return None
 
@@ -431,9 +534,15 @@ def compute_core_metrics(daily_records: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def fetch_yf_fundamentals(symbol: str) -> Dict[str, Any]:
+def fetch_yf_fundamentals(
+    log: logging.Logger,
+    tracked_symbol: str,
+    diagnostics: Dict[str, Any],
+) -> Dict[str, Any]:
+    yf_symbol = resolve_yf_ticker(tracked_symbol)
+    log.debug(f"yfinance fundamentals: {tracked_symbol} -> {yf_symbol}")
     try:
-        t = yf.Ticker(symbol)
+        t = yf.Ticker(yf_symbol)
         info = t.info or {}
         keys = [
             "shortName",
@@ -457,31 +566,74 @@ def fetch_yf_fundamentals(symbol: str) -> Dict[str, Any]:
             "currency",
         ]
         curated = {k: info.get(k) for k in keys if k in info}
+        curated["yf_ticker"] = yf_symbol
         return {"curated_info": curated}
     except Exception as e:
-        return {"error": str(e)}
+        diagnostics.setdefault("symbol_errors", {}).setdefault(tracked_symbol, []).append(
+            {
+                "where": "fetch_yf_fundamentals",
+                "tracked_symbol": tracked_symbol,
+                "yfinance_ticker": yf_symbol,
+                "error": str(e),
+                "trace": short_tb(e),
+            }
+        )
+        return {"error": str(e), "yf_ticker": yf_symbol}
 
 
-def fetch_ibkr_fundamentals(ib: IB, symbol: str) -> Dict[str, Any]:
-    contract = Stock(symbol, "SMART", "USD")
-    ib.qualifyContracts(contract)
-    out: Dict[str, Any] = {}
+def fetch_ibkr_fundamentals(
+    log: logging.Logger,
+    ib: IB,
+    symbol: str,
+    diagnostics: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Fetch IBKR fundamentals (ReportSnapshot) using in-script contract overrides."""
+    out: Dict[str, Any] = {"symbol": symbol}
     try:
+        exchange, currency, primary_exchange = resolve_ibkr_contract(symbol)
+
+        contract = Stock(symbol, exchange, currency)
+        if primary_exchange:
+            contract.primaryExchange = primary_exchange
+
+        ib.qualifyContracts(contract)
+
+        out["contract"] = {
+            "conId": contract.conId,
+            "secType": contract.secType,
+            "exchange": contract.exchange,
+            "primaryExchange": getattr(contract, "primaryExchange", None),
+            "currency": contract.currency,
+        }
+
+        log.debug(f"IBKR fundamentals: requesting ReportSnapshot for {symbol} ({out['contract']})")
         xml = ib.reqFundamentalData(contract, reportType="ReportSnapshot")
         out["report_type"] = "ReportSnapshot"
         out["raw_snapshot_xml"] = xml
+
     except Exception as e:
+        diagnostics.setdefault("symbol_errors", {}).setdefault(symbol, []).append(
+            {
+                "where": "fetch_ibkr_fundamentals",
+                "tracked_symbol": symbol,
+                "error": str(e),
+                "trace": short_tb(e),
+            }
+        )
         out["error"] = str(e)
+
     return out
 
 
-def build_meta(mode_cfg: ModeConfig, tracked: List[str], ignored: List[str], portfolio: Dict[str, Any]) -> Dict[str, Any]:
+def build_meta(mode_cfg: ModeConfig, tracked: List[str]) -> Dict[str, Any]:
     return {
         "generated_at_utc": iso_now_utc(),
         "mode": mode_cfg.mode,
         "tracked_symbols": tracked,
-        "ignored_symbols_config": ignored,
-        "portfolio_ignored_positions_detected": portfolio.get("derived", {}).get("ignored_positions_detected", []),
+        "mappings": {
+            "yfinance_overrides": YF_TICKER_OVERRIDES,
+            "ibkr_contract_overrides": IBKR_CONTRACT_OVERRIDES,
+        },
         "convention": {
             "price_basis": "close",
             "high_12m_window_trading_days": WINDOW_HIGH_12M_TRADING_DAYS,
@@ -502,14 +654,25 @@ def build_meta(mode_cfg: ModeConfig, tracked: List[str], ignored: List[str], por
 
 def main() -> int:
     args = parse_args()
+    log = setup_logging(args.debug)
     mode_cfg = build_mode_config(args)
 
     tracked_symbols = parse_csv_symbols(args.symbols)
-    ignored_symbols = parse_csv_symbols(args.ignore)
 
     ensure_dir(args.output_dir)
 
-    ib = connect_ib(args.host, args.port, args.client_id)
+    diagnostics: Dict[str, Any] = {
+        "run": {"debug": bool(args.debug)},
+        "global_errors": [],
+        "symbol_errors": {},
+    }
+
+    # Print resolved mapping up-front (so we can spot if IB1T isn't mapped)
+    resolved_map = {s: resolve_yf_ticker(s) for s in tracked_symbols}
+    log.info(f"Resolved yfinance tickers: {resolved_map}")
+    diagnostics["run"]["resolved_yfinance_map"] = resolved_map
+
+    ib = connect_ib(args.host, args.port, args.client_id, log)
     try:
         portfolio_base = fetch_portfolio(ib)
         portfolio_derived = derive_tracked(portfolio_base, tracked_symbols)
@@ -519,13 +682,15 @@ def main() -> int:
         if mode_cfg.include_open_orders:
             try:
                 open_orders = fetch_open_orders(ib)
-            except Exception:
+            except Exception as e:
+                diagnostics["global_errors"].append({"where": "fetch_open_orders", "error": str(e), "trace": short_tb(e)})
                 open_orders = []
 
-        daily_dfs = yf_download_daily(tracked_symbols, years=mode_cfg.daily_years)
+        daily_dfs = yf_download_daily(log, tracked_symbols, years=mode_cfg.daily_years, diagnostics=diagnostics)
 
         symbols_doc: Dict[str, Any] = {}
         for symbol in tracked_symbols:
+            log.info(f"Processing symbol {symbol} (yfinance={resolve_yf_ticker(symbol)})")
             df_daily = daily_dfs.get(symbol)
             daily_records = df_to_records(df_daily, max_rows=mode_cfg.daily_max_rows, is_intraday=False)
             core_metrics = compute_core_metrics(daily_records)
@@ -533,19 +698,20 @@ def main() -> int:
             sym_doc: Dict[str, Any] = {
                 "core_metrics": core_metrics,
                 "history": {"daily": daily_records},
+                "yfinance_ticker": resolve_yf_ticker(symbol),
             }
 
             if mode_cfg.include_intraday:
-                df_intra = yf_download_intraday_1h(symbol)
+                df_intra = yf_download_intraday_1h(log, symbol, diagnostics)
                 intraday_records = df_to_records(df_intra, max_rows=INTRADAY_MAX_ROWS, is_intraday=True)
                 sym_doc["history"]["intraday_1h_6m"] = intraday_records
 
             if mode_cfg.include_fundamentals:
                 fundamentals: Dict[str, Any] = {}
                 if FETCH_YFINANCE_FUNDAMENTALS_IN_FULL and not args.no_yf_fundamentals:
-                    fundamentals["yfinance"] = fetch_yf_fundamentals(symbol)
+                    fundamentals["yfinance"] = fetch_yf_fundamentals(log, symbol, diagnostics)
                 if FETCH_IBKR_FUNDAMENTALS_IN_FULL and not args.no_ibkr_fundamentals:
-                    fundamentals["ibkr"] = fetch_ibkr_fundamentals(ib, symbol)
+                    fundamentals["ibkr"] = fetch_ibkr_fundamentals(log, ib, symbol, diagnostics)
                 sym_doc["fundamentals"] = fundamentals
 
             if open_orders:
@@ -553,9 +719,13 @@ def main() -> int:
 
             symbols_doc[symbol] = sym_doc
 
-        meta = build_meta(mode_cfg, tracked_symbols, ignored_symbols, portfolio)
-
-        snapshot: Dict[str, Any] = {"meta": meta, "portfolio": portfolio, "symbols": symbols_doc}
+        meta = build_meta(mode_cfg, tracked_symbols)
+        snapshot: Dict[str, Any] = {
+            "meta": meta,
+            "diagnostics": diagnostics,
+            "portfolio": portfolio,
+            "symbols": symbols_doc,
+        }
 
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         filename = f"portfolio_snapshot_{ts}.json"
@@ -563,10 +733,12 @@ def main() -> int:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, indent=2)
 
+        log.info(f"Wrote snapshot: {path}")
         print(f"SNAPSHOT_PATH={path}")
         return 0
     finally:
         ib.disconnect()
+        log.info("Disconnected from IBKR.")
 
 
 if __name__ == "__main__":

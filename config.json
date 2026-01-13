@@ -1,7 +1,15 @@
 {
   "symbols": {
-    "tracked": ["NVDA", "MSFT", "AMZN", "META", "GOOGL"],
-    "ignored": ["COST"]
+    "tracked": [
+      "NVDA",
+      "MSFT",
+      "AMZN",
+      "META",
+      "GOOGL"
+    ],
+    "btc": {
+      "symbol": "IB1T"
+    }
   },
   "dca": {
     "monthly_budget_usd": 1000,
@@ -17,7 +25,6 @@
   },
   "opportunistic": {
     "monthly_budget_usd": 3000,
-    "allow_exceed_available_cash": false,
     "drawdown_entry_threshold_pct": -15,
     "buy_pct_at_entry": 0.3,
     "drawdown_full_allocation_pct": -25,
@@ -26,7 +33,6 @@
       "MSFT": 35
     },
     "per_symbol_monthly_cap_usd": 1500,
-    "forbid_nvda_when_largest_holding": true,
     "ma200_penalty_start_pct": 0.0,
     "ma200_penalty_full_pct": 10.0,
     "ma200_max_penalty": 0.5,
@@ -43,6 +49,26 @@
       "tif": "GTD",
       "gtd_end_of_month_utc_hour": 20,
       "gtd_end_of_month_utc_minute": 0
+    }
+  },
+  "btc": {
+    "monthly_budget_usd": 300,
+    "opportunistic": {
+      "drawdown_entry_threshold_pct": -25,
+      "buy_pct_at_entry": 0.25,
+      "drawdown_full_allocation_pct": -45,
+      "per_monthly_cap_usd": 300,
+      "ma200_penalty_start_pct": 0.0,
+      "ma200_penalty_full_pct": 15.0,
+      "ma200_max_penalty": 0.5,
+      "tranche2": {
+        "enabled": true,
+        "drawdown_unlock_threshold_pct": -35,
+        "ma200_multiplier": 1.05,
+        "tif": "GTD",
+        "gtd_end_of_month_utc_hour": 20,
+        "gtd_end_of_month_utc_minute": 0
+      }
     }
   }
 }
