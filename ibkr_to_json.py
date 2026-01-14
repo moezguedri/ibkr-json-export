@@ -40,10 +40,12 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import logging
 
 import yfinance as yf
-from ib_insync import IB, Stock
-
+from ib_insync import IB
+import asyncio
+import socket
 
 # ===================== USER CONFIGURATION ===================== #
 
@@ -103,7 +105,6 @@ YF_MAX_RETRIES = 3
 YF_RETRY_BACKOFF_SEC = 1.5
 
 # ============================================================= #
-
 
 @dataclass
 class ModeConfig:
@@ -165,6 +166,7 @@ def resolve_ibkr_contract(symbol: str) -> Tuple[str, str, Optional[str]]:
 
 def setup_logging(debug: bool) -> logging.Logger:
     level = logging.DEBUG if debug else logging.INFO
+    logging.getLogger("ib_insync").setLevel(logging.WARNING)
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -247,12 +249,49 @@ def build_mode_config(args: argparse.Namespace) -> ModeConfig:
     )
 
 
-def connect_ib(host: str, port: int, client_id: int, log: logging.Logger) -> IB:
-    ib = IB()
-    log.info(f"Connecting to IBKR API {host}:{port} clientId={client_id} ...")
-    ib.connect(host, port, clientId=client_id)
-    log.info("Connected to IBKR.")
-    return ib
+class IBKRConnectionError(RuntimeError):
+    pass
+
+def is_ibkr_exception(e: Exception) -> bool:
+    """
+    Version-proof IBKR exception detection.
+    We treat as IBKR-related:
+      - connection/transport errors
+      - any exception whose class/module comes from ib_insync
+      - any exception that looks like IBKR API error (has errorCode/reqId etc.)
+    """
+    if isinstance(e, (ConnectionRefusedError, TimeoutError, asyncio.TimeoutError, socket.error, OSError)):
+        return True
+
+    mod = type(e).__module__ or ""
+    name = type(e).__name__ or ""
+    if mod.startswith("ib_insync") or "ib_insync" in mod:
+        return True
+
+    # common ib_insync/IBKR error shapes
+    if hasattr(e, "errorCode") or hasattr(e, "code") or hasattr(e, "reqId"):
+        return True
+
+    # last resort: class name used in some versions
+    if name in {"RequestError", "IBError"}:
+        return True
+
+    return False
+
+def connect_ib(host: str, port: int, client_id: int, log) -> IB:
+    try:
+        ib = IB()
+        ib.connect(host, port, clientId=client_id)
+        return ib
+
+    except Exception as e:
+        # We assume this function is ONLY used for IBKR connect,
+        # so any exception here is an IBKR failure by definition.
+        log.error(
+            "IBKR connection failed (host=%s port=%s clientId=%s): %s",
+            host, port, client_id, e
+        )
+        raise IBKRConnectionError("IBKR connection failed") from e
 
 
 def fetch_portfolio(ib: IB) -> Dict[str, Any]:
@@ -653,8 +692,16 @@ def build_meta(mode_cfg: ModeConfig, tracked: List[str]) -> Dict[str, Any]:
 
 
 def main() -> int:
+
     args = parse_args()
     log = setup_logging(args.debug)
+
+    try:
+        ib = connect_ib(args.host, args.port, args.client_id, log)
+    except IBKRConnectionError:
+        # clean early exit, no traceback
+        return 2
+
     mode_cfg = build_mode_config(args)
 
     tracked_symbols = parse_csv_symbols(args.symbols)
@@ -672,7 +719,6 @@ def main() -> int:
     log.info(f"Resolved yfinance tickers: {resolved_map}")
     diagnostics["run"]["resolved_yfinance_map"] = resolved_map
 
-    ib = connect_ib(args.host, args.port, args.client_id, log)
     try:
         portfolio_base = fetch_portfolio(ib)
         portfolio_derived = derive_tracked(portfolio_base, tracked_symbols)
