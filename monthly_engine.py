@@ -434,6 +434,84 @@ def get_symbol_core(snapshot: Dict[str, Any], symbol: str) -> Dict[str, Any]:
     return snapshot.get("symbols", {}).get(symbol, {}).get("core_metrics", {}) or {}
 
 
+def get_symbol_last_price(snapshot: Dict[str, Any], symbol: str) -> float:
+    """Best-effort extraction of a 'current' price from the snapshot.
+
+    This is for DISPLAY only (reporting). The engine decisions are based on
+    drawdown/MA200 metrics already present in the snapshot.
+
+    We try a few common paths to keep backward compatibility with different
+    snapshot generators.
+    """
+    sym = (symbol or "").upper()
+    sym_obj = snapshot.get("symbols", {}).get(sym, {}) or {}
+
+    # Prefer core_metrics.last_close if present
+    core = sym_obj.get("core_metrics", {}) or {}
+    for k in ("last_close", "last_price", "price", "close"):
+        v = safe_float(core.get(k), default=float("nan"))
+        if not math.isnan(v):
+            return v
+
+    # Some generators store quotes under a different subtree
+    for path in (
+        ("market", "last"),
+        ("market", "last_price"),
+        ("quote", "last"),
+        ("quote", "last_price"),
+        ("quote", "mid"),
+        ("quote", "close"),
+    ):
+        cur: Any = sym_obj
+        ok = True
+        for p in path:
+            if not isinstance(cur, dict) or p not in cur:
+                ok = False
+                break
+            cur = cur[p]
+        if ok:
+            v = safe_float(cur, default=float("nan"))
+            if not math.isnan(v):
+                return v
+
+    return float("nan")
+
+
+def resolve_symbol_last_price_usd(symbol: str, snapshot: Dict[str, Any], yf_ticker: Optional[str] = None) -> Tuple[float, str]:
+    """Resolve last price for reporting.
+
+    Priority:
+      1) snapshot-derived price (fast, offline)
+      2) yfinance fast_info/1d close (online; best-effort)
+
+    Returns: (price, source)
+    """
+    snap_px = get_symbol_last_price(snapshot, symbol)
+    if not math.isnan(snap_px):
+        return snap_px, f"snapshot:{symbol}"
+
+    # Best-effort yfinance fallback (do NOT fail the engine if it breaks)
+    t = (yf_ticker or symbol).strip()
+    try:
+        tk = yf.Ticker(t)
+        fi = getattr(tk, "fast_info", None) or {}
+        px = safe_float(fi.get("last_price"), default=float("nan"))
+        if not math.isnan(px):
+            return px, f"yfinance:{t}(fast_info)"
+    except Exception:
+        pass
+
+    try:
+        df = yf.download(t, period="5d", interval="1d", auto_adjust=False, progress=False, threads=False)
+        closes = _extract_close_series_from_yf_df(df)
+        if closes:
+            return float(closes[-1]), f"yfinance:{t}(close)"
+    except Exception:
+        pass
+
+    return float("nan"), f"missing:{symbol}"
+
+
 # ---------------- BTC metrics fallback (self-contained, with rollback) ----------------
 
 def _extract_close_series_from_yf_df(df) -> List[float]:
@@ -874,12 +952,17 @@ def build_btc_opportunistic_plan(
 
     drawdown = safe_float(core.get("drawdown_12m_close_pct"), default=float("nan"))
     price_vs_ma200 = safe_float(core.get("price_vs_ma200_pct"), default=float("nan"))
+    last_px = safe_float(core.get("last_close"), default=float("nan"))
+    if math.isnan(last_px):
+        last_px = get_symbol_last_price(snapshot, sym)
 
     # Eligibility: drawdown threshold
     if math.isnan(drawdown) or drawdown > btc.drawdown_entry_threshold_pct:
         plan = {
             "symbol": sym,
             "eligible": False,
+            "last_price": (None if math.isnan(last_px) else float(last_px)),
+            "last_price_source": metrics_source if not math.isnan(last_px) else "unavailable",
             "drawdown_12m_close_pct": drawdown,
             "price_vs_ma200_pct": price_vs_ma200,
             "base_budget_usd": round_money(effective_budget),
@@ -913,6 +996,8 @@ def build_btc_opportunistic_plan(
     plan = {
         "symbol": sym,
         "eligible": True,
+        "last_price": (None if math.isnan(last_px) else float(last_px)),
+        "last_price_source": metrics_source if not math.isnan(last_px) else "unavailable",
         "drawdown_12m_close_pct": drawdown,
         "price_vs_ma200_pct": price_vs_ma200,
         "base_budget_usd": round_money(effective_budget),
@@ -1115,8 +1200,12 @@ def print_btc_section(btc_plan: Optional[Dict[str, Any]], btc_tr2_order: Optiona
     if not eligible:
         dd = btc_plan.get("drawdown_12m_close_pct")
         pv = btc_plan.get("price_vs_ma200_pct")
+        lp = btc_plan.get("last_price")
+        lps = btc_plan.get("last_price_source")
         reasons = btc_plan.get("blocked_reasons", [])
         print(f"  {sym}: NOT eligible this run.")
+        if lp is not None:
+            print(f"    last_price = {lp} ({lps})")
         print(f"    drawdown_12m_close_pct = {dd}")
         print(f"    price_vs_ma200_pct = {pv}")
         if reasons:
@@ -1126,6 +1215,8 @@ def print_btc_section(btc_plan: Optional[Dict[str, Any]], btc_tr2_order: Optiona
 
     dd = btc_plan.get("drawdown_12m_close_pct")
     pv = btc_plan.get("price_vs_ma200_pct")
+    lp = btc_plan.get("last_price")
+    lps = btc_plan.get("last_price_source")
     base = btc_plan.get("base_budget_usd")
     tr1 = btc_plan.get("tr1_amount_usd")
     intensity = btc_plan.get("drawdown_intensity")
@@ -1133,6 +1224,8 @@ def print_btc_section(btc_plan: Optional[Dict[str, Any]], btc_tr2_order: Optiona
 
     print(f"  {sym}: eligible")
     print(f"    base_budget_usd = {base}")
+    if lp is not None:
+        print(f"    last_price = {lp} ({lps})")
     print(f"    drawdown_12m_close_pct = {dd}")
     print(f"    price_vs_ma200_pct = {pv}")
     print(f"    TR1 amount (buy now) = {tr1} USD  (intensity={intensity}, ma200_multiplier={mult})")
@@ -1198,12 +1291,13 @@ def print_report(
     print(f"run_id_utc: {iso_utc_now()}")
     print("")
 
-    headers = ["SYMBOL", "WGT%", "DD12M%", "Px-vs-MA200%", "DCA_USD", "OPP_TR1_USD", "TOTAL_USD", "NOTES"]
-    widths = [6, 7, 7, 12, 8, 11, 9, 48]
+    headers = ["SYMBOL", "PRICE", "WGT%", "DD12M%", "Px-vs-MA200%", "DCA_USD", "OPP_TR1_USD", "TOTAL_USD", "NOTES"]
+    widths = [6, 9, 7, 7, 12, 8, 11, 9, 48]
     print(format_table_row(headers, widths))
     print("-" * (sum(widths) + 3 * (len(widths) - 1)))
 
     for symbol in cfg.symbols.tracked_actions:
+        px, _px_src = resolve_symbol_last_price_usd(symbol, snapshot)
         wgt = safe_float(dca_plan[symbol]["current_weight_pct"])
         dd = safe_float(opp_plan[symbol].get("drawdown_12m_close_pct", float("nan")))
         pv = safe_float(opp_plan[symbol].get("price_vs_ma200_pct", float("nan")))
@@ -1219,6 +1313,7 @@ def print_report(
 
         row = [
             symbol,
+            f"{px:8.2f}" if not math.isnan(px) else "     NaN",
             f"{wgt:5.2f}" if not math.isnan(wgt) else "  NaN",
             f"{dd:5.2f}" if not math.isnan(dd) else "  NaN",
             f"{pv:8.2f}" if not math.isnan(pv) else "     NaN",
