@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import logging
+from pathlib import Path
 
 import yfinance as yf
 from ib_insync import IB
@@ -48,9 +49,6 @@ import asyncio
 import socket
 
 # ===================== USER CONFIGURATION ===================== #
-
-# Symbols you want to track in the snapshot (IBKR symbols, not Yahoo symbols)
-DEFAULT_TRACKED_SYMBOLS = ["NVDA", "MSFT", "AMZN", "META", "GOOGL", "IB1T", "COST"]
 
 # Mapping: IBKR symbol -> Yahoo Finance ticker used by yfinance
 # (This is the fix for your IB1T 404 problem.)
@@ -103,6 +101,17 @@ YFINANCE_THREADS = True
 # yfinance retries
 YF_MAX_RETRIES = 3
 YF_RETRY_BACKOFF_SEC = 1.5
+
+# ============================================================= #
+
+def load_symbols_from_config() -> list:
+    config_path = Path("config.json").expanduser().resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"config.json not found: {config_path}")
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    # symbols
+    symbols_raw = raw.get("symbols", {})
+    return symbols_raw.get("tracked")
 
 # ============================================================= #
 
@@ -195,9 +204,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_DIR,
         help=f"Directory to write snapshots (default: {DEFAULT_OUTPUT_DIR})",
     )
+    # Symbols you want to track in the snapshot (IBKR symbols, not Yahoo symbols)
+    tracked_symbols = load_symbols_from_config()
     p.add_argument(
         "--symbols",
-        default=",".join(DEFAULT_TRACKED_SYMBOLS),
+        default=",".join(tracked_symbols),
         help="Comma-separated tracked symbols (IBKR symbols) (default from script).",
     )
     p.add_argument("--host", default=IB_HOST, help="IBKR API host (default from script).")

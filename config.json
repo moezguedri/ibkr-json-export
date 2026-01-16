@@ -3,72 +3,138 @@
     "tracked": [
       "NVDA",
       "MSFT",
+      "GOOGL",
+      "GOOG",
       "AMZN",
       "META",
-      "GOOGL"
-    ],
-    "btc": {
-      "symbol": "IB1T"
-    }
+      "AAPL",
+      "ASML",
+      "AMD",
+      "AVGO",
+      "ANET",
+      "QCOM",
+      "TXN",
+      "TSM",
+      "ETN",
+      "HON",
+      "LIN",
+      "ABT",
+      "TMO",
+      "JNJ",
+      "MDT",
+      "DHR",
+      "LLY",
+      "COST",
+      "WMT",
+      "VRT"
+    ]
   },
   "dca": {
     "monthly_budget_usd": 1000,
     "target_weights_pct": {
-      "MSFT": 30,
       "AMZN": 20,
       "GOOGL": 22,
       "META": 18,
+      "MSFT": 30,
       "NVDA": 10
     },
     "block_if_current_weight_pct_ge_target": true,
     "block_tolerance_pct": 0.0
   },
   "opportunistic": {
-    "monthly_budget_usd": 3000,
-    "drawdown_entry_threshold_pct": -15,
-    "buy_pct_at_entry": 0.3,
-    "drawdown_full_allocation_pct": -25,
-    "max_position_weight_pct_default": 20,
-    "max_position_weight_pct_overrides": {
-      "MSFT": 35
+    "enabled": true,
+    "tranche1": {
+      "monthly_budget_usd": 3000,
+      "entry_drawdown_pct": -15,
+      "full_drawdown_pct": -25,
+      "buy_pct_at_entry": 0.30,
+      "execution": "BUY_NOW",
+      "overrides": [
+        {
+          "groups": [
+            "AAPL",
+            "ASML",
+            "AMD",
+            "AVGO",
+            "ANET",
+            "QCOM",
+            "TXN",
+            "TSM",
+            "ETN",
+            "HON",
+            "LIN",
+            "ABT",
+            "TMO",
+            "JNJ",
+            "MDT",
+            "DHR",
+            "LLY",
+            "COST",
+            "WMT",
+            "VRT"
+          ],
+          "entry_drawdown_pct": -20,
+          "full_drawdown_pct": -35,
+          "buy_pct_at_entry": 0.25
+        }
+      ]
     },
-    "per_symbol_monthly_cap_usd": 1500,
-    "ma200_penalty_start_pct": 0.0,
-    "ma200_penalty_full_pct": 10.0,
-    "ma200_max_penalty": 0.5,
-    "tranche2_limit": {
+    "tranche2": {
+      "monthly_budget_usd": 3000,
+      "entry_drawdown_pct": -25,
+      "full_drawdown_pct": -40,
+      "buy_pct_at_entry": 0.60,
+      "execution": "LIMIT_ONLY",
+      "ma200_threshold_multiplier": 1.00,
+      "overrides": [
+        {
+          "groups": [
+            "AAPL",
+            "ASML",
+            "AMD",
+            "AVGO",
+            "ANET",
+            "QCOM",
+            "TXN",
+            "TSM",
+            "ETN",
+            "HON",
+            "LIN",
+            "ABT",
+            "TMO",
+            "JNJ",
+            "MDT",
+            "DHR",
+            "LLY",
+            "COST",
+            "WMT",
+            "VRT"
+          ],
+          "entry_drawdown_pct": -35,
+          "full_drawdown_pct": -55,
+          "buy_pct_at_entry": 0.70,
+          "ma200_threshold_multiplier": 1.05
+        }
+      ]
+    },
+    "tranche3": {
       "enabled": true,
-      "drawdown_unlock_threshold_pct": -20,
-      "ma200_threshold_multipliers": {
-        "MSFT": 1.0,
-        "GOOGL": 1.02,
-        "AMZN": 1.03,
-        "META": 1.0,
-        "NVDA": 1.0
-      },
-      "tif": "GTD",
-      "gtd_end_of_month_utc_hour": 20,
-      "gtd_end_of_month_utc_minute": 0
+      "monthly_budget_usd": 3000,
+      "entry_drawdown_pct": -40,
+      "full_drawdown_pct": -60,
+      "buy_pct_at_entry": 0.80,
+      "execution": "LIMIT_ONLY",
+      "ma200_threshold_multiplier": 0.95
     }
   },
   "btc": {
+    "enabled": true,
     "monthly_budget_usd": 300,
-    "opportunistic": {
-      "drawdown_entry_threshold_pct": -25,
-      "buy_pct_at_entry": 0.25,
-      "drawdown_full_allocation_pct": -45,
-      "per_monthly_cap_usd": 300,
-      "ma200_penalty_start_pct": 0.0,
-      "ma200_penalty_full_pct": 15.0,
-      "ma200_max_penalty": 0.5,
-      "tranche2": {
-        "enabled": true,
-        "drawdown_unlock_threshold_pct": -35,
-        "ma200_multiplier": 1.05,
-        "tif": "GTD",
-        "gtd_end_of_month_utc_hour": 20,
-        "gtd_end_of_month_utc_minute": 0
-      }
-    }
+    "drawdown_entry_threshold_pct": -25,
+    "drawdown_full_allocation_pct": -45,
+    "buy_pct_at_entry": 0.25,
+    "ma200_penalty_start_pct": 0,
+    "ma200_penalty_full_pct": 15,
+    "ma200_max_penalty": 0.5
   }
 }
