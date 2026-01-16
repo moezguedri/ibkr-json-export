@@ -45,6 +45,7 @@
     "enabled": true,
     "tranche1": {
       "monthly_budget_usd": 3000,
+      "per_monthly_cap_usd": 1500,
       "entry_drawdown_pct": -15,
       "full_drawdown_pct": -25,
       "buy_pct_at_entry": 0.30,
@@ -81,6 +82,7 @@
     },
     "tranche2": {
       "monthly_budget_usd": 3000,
+      "per_monthly_cap_usd": 1500,
       "entry_drawdown_pct": -25,
       "full_drawdown_pct": -40,
       "buy_pct_at_entry": 0.60,
@@ -120,6 +122,7 @@
     "tranche3": {
       "enabled": true,
       "monthly_budget_usd": 3000,
+      "per_monthly_cap_usd": 1500,
       "entry_drawdown_pct": -40,
       "full_drawdown_pct": -60,
       "buy_pct_at_entry": 0.80,

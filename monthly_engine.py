@@ -291,6 +291,9 @@ def load_config(config_path: Path) -> EngineConfig:
         vv.setdefault("tif", "GTD")
         vv.setdefault("gtd_end_of_month_utc_hour", 20)
         vv.setdefault("gtd_end_of_month_utc_minute", 0)
+        
+        # default cap
+        vv.setdefault("per_monthly_cap_usd", 0)
 
         tranches[k] = vv
 
@@ -906,6 +909,7 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
             entry_dd = float(params["entry_drawdown_pct"])
             full_dd = float(params["full_drawdown_pct"])
             buy_at_entry = float(params["buy_pct_at_entry"])
+            per_monthly_cap_usd = float(params["per_monthly_cap_usd"])
             execution = str(params["execution"]).upper()
 
             intensity = compute_drawdown_intensity(
@@ -916,6 +920,9 @@ def build_opportunistic_plan(cfg: EngineConfig, snapshot: Dict[str, Any]) -> Tup
             )
 
             amount = round_money(base_budget * intensity)
+            # Apply cap
+            if 0 < per_monthly_cap_usd: amount = min(per_monthly_cap_usd, amount)
+
             if amount <= 0:
                 continue
 
