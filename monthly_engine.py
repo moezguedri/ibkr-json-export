@@ -1321,6 +1321,7 @@ def print_tranche2_orders_actions(orders: List[Dict[str, Any]], warnings: List[s
 
 def print_report(
     cfg: EngineConfig,
+    symbols_all_sorted: list,
     snapshot_path: Path,
     snapshot: Dict[str, Any],
     dca_plan: Dict[str, Any],
@@ -1345,7 +1346,7 @@ def print_report(
     print(format_table_row(headers, widths))
     print("-" * (sum(widths) + 3 * (len(widths) - 1)))
 
-    for symbol in cfg.symbols.tracked_actions:
+    for symbol in symbols_all_sorted:
         px, _px_src = resolve_symbol_last_price_usd(symbol, snapshot)
         wgt = safe_float(dca_plan[symbol]["current_weight_pct"])
 
@@ -1466,8 +1467,26 @@ def main() -> int:
         "opp_effective_budget_usd": round_money(opp_effective_budget),
     }
 
+    def _dd_sort_key(dd: float) -> float:
+        # On met les NaN à la fin
+        if dd is None or math.isnan(dd):
+            return 1e9
+        return dd
+
+    def sort_key(symbol: str) -> tuple:
+        target = safe_float(cfg.dca.target_weights_pct.get(symbol), float("nan"))
+        is_core = (not math.isnan(target)) and (target > 0.0)
+        dd = safe_float(opp_plan.get(symbol, {}).get("drawdown_12m_close_pct"), float("nan"))
+        # core d'abord => 0, non-core => 1
+        return (0 if is_core else 1, _dd_sort_key(dd), symbol)
+        
+    symbols_all = list(snapshot.get("symbols", {}).keys())  # ou la liste que tu utilises déjà
+    symbols_all_sorted = sorted(symbols_all, key=sort_key)
+
+
     print_report(
         cfg=cfg,
+        symbols_all_sorted=symbols_all_sorted,
         snapshot_path=snapshot_path,
         snapshot=snapshot,
         dca_plan=dca_plan,
