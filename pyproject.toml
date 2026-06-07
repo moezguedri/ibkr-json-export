@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "ibkr-json-export"
+version = "0.1.0"
+description = "IBKR portfolio snapshot & monthly allocation engine"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ib_insync>=0.9.86",
+    "yfinance>=0.2.40",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "tzdata>=2023.3",
+]
+
+[project.scripts]
+ibkr-snapshot = "ibkr_to_json:main"
+ibkr-engine   = "monthly_engine:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ibkr_to_json", "monthly_engine", "stress_test_thresholds"]

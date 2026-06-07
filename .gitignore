@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+dist/
+build/
+.Python
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Output directories
+snapshots/
+decisions/
+
+# Secrets / local overrides
+.env
+*.env.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo

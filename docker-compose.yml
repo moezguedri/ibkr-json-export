@@ -1,0 +1,27 @@
+services:
+  # Offline decision engine — no IBKR required, reads from ./snapshots
+  engine:
+    build: .
+    volumes:
+      - ./snapshots:/app/snapshots
+      - ./decisions:/app/decisions
+      - ./config.json:/app/config.json:ro
+    command: python monthly_engine.py
+
+  # Snapshot generator — needs IBKR TWS / IB Gateway reachable on the host
+  snapshot:
+    build: .
+    volumes:
+      - ./snapshots:/app/snapshots
+    environment:
+      IBKR_HOST: host.docker.internal
+      IBKR_PORT: "7496"
+      IBKR_CLIENT_ID: "1"
+    # Exposes host.docker.internal on Linux (noop on Mac/Windows where it's built-in)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >
+      python ibkr_to_json.py --light
+      --host ${IBKR_HOST:-host.docker.internal}
+      --port ${IBKR_PORT:-7496}
+      --client-id ${IBKR_CLIENT_ID:-1}

@@ -43,10 +43,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import logging
 from pathlib import Path
 
-import yfinance as yf
-from ib_insync import IB
 import asyncio
 import socket
+
+# eventkit (ib_insync dep) calls get_event_loop() at import time, which raises
+# RuntimeError on Python 3.12+ when no loop exists yet.
+asyncio.set_event_loop(asyncio.new_event_loop())
+
+import yfinance as yf
+from ib_insync import IB
 
 # ===================== USER CONFIGURATION ===================== #
 
@@ -71,7 +76,7 @@ IBKR_DEFAULT_CURRENCY = "USD"
 
 # IBKR connection defaults (TWS / IB Gateway)
 IB_HOST = "127.0.0.1"
-IB_PORT = 4001
+IB_PORT = 7496
 IB_CLIENT_ID = 7
 
 DEFAULT_OUTPUT_DIR = "snapshots"
