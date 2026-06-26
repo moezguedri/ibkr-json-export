@@ -1,0 +1,28 @@
+{
+  "split": "holdout-chinook",
+  "n_questions": 40,
+  "base": {
+    "tag": "base",
+    "n": 40,
+    "answerable": 7,
+    "refusal_questions": 4,
+    "json_valid": 39,
+    "intent_match_gold": 4,
+    "genuine_refusal_correct": 0,
+    "compiler_rescued": 4,
+    "compiled_to_sql": 6,
+    "compiled_to_refusal": 34
+  },
+  "sft": {
+    "tag": "sft",
+    "n": 40,
+    "answerable": 7,
+    "refusal_questions": 4,
+    "json_valid": 40,
+    "intent_match_gold": 36,
+    "genuine_refusal_correct": 3,
+    "compiler_rescued": 1,
+    "compiled_to_sql": 4,
+    "compiled_to_refusal": 36
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "base_model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "seed": 0,
+  "train_file": "sft_train.jsonl",
+  "train_sha256": "9948fed4e9dea82e",
+  "n_train": 116,
+  "n_eval": 57,
+  "lib_versions": {
+    "torch": "2.12.0+cu130",
+    "transformers": "5.12.1",
+    "peft": "0.19.1",
+    "trl": "1.7.0",
+    "datasets": "5.0.0"
+  },
+  "lora": {
+    "r": 16,
+    "alpha": 32,
+    "targets": [
+      "down_proj",
+      "gate_proj",
+      "k_proj",
+      "o_proj",
+      "q_proj",
+      "up_proj",
+      "v_proj"
+    ]
+  },
+  "hparams": {
+    "epochs": 3.0,
+    "lr": 0.0002,
+    "batch": 1,
+    "grad_accum": 8,
+    "4bit": true
+  },
+  "final_train_loss": 0.15771533166989685
+}

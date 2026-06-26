@@ -1,0 +1,16 @@
+{
+  "train": "sft_train.jsonl",
+  "eval": "sft_eval.jsonl",
+  "out": "mapper-1.5b-sft-v1",
+  "base": "Qwen/Qwen2.5-1.5B-Instruct",
+  "epochs": 3.0,
+  "lr": 0.0002,
+  "rank": 16,
+  "alpha": 32,
+  "batch": 1,
+  "grad_accum": 8,
+  "max_seq": 2048,
+  "no_4bit": false,
+  "base_model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "seed": 0
+}

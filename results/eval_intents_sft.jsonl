@@ -1,0 +1,40 @@
+{"id": "CHINOOK-001", "db": "chinook", "intent": "{\"status\": \"ok\", \"measure\": \"track.count\", \"filters\": []}", "raw": "{\"status\":\"ok\",\"measure\":\"track.count\",\"filters\":[]}"}
+{"id": "CHINOOK-002", "db": "chinook", "intent": "{\"status\": \"ok\", \"measure\": \"genre.count\", \"filters\": []}", "raw": "{\"status\":\"ok\",\"measure\":\"genre.count\",\"filters\":[]}"}
+{"id": "CHINOOK-003", "db": "chinook", "intent": "{\"status\": \"ok\", \"measure\": \"customer.count\", \"filters\": [{\"concept\": \"customer.country\"}, {\"concept\": \"USA\"}]}", "raw": "{\"status\":\"ok\",\"measure\":\"customer.count\",\"filters\":[{\"concept\":\"customer.country\"},{\"concept\":\"USA\"}]}"}
+{"id": "CHINOOK-004", "db": "chinook", "intent": "{\"status\": \"ok\", \"measure\": \"invoice.count\", \"filters\": []}", "raw": "{\"status\":\"ok\",\"measure\":\"invoice.count\",\"filters\":[]}"}
+{"id": "CHINOOK-005", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-006", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-007", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-008", "db": "chinook", "intent": "{\"status\": \"not_expressible\", \"concept\": \"track.price_point\"}", "raw": "{\"status\":\"not_expressible\",\"concept\":\"track.price_point\"}"}
+{"id": "CHINOOK-009", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-010", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-011", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-012", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-013", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-014", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-015", "db": "chinook", "intent": "{\"status\": \"ok\", \"measure\": \"invoice.avg_total\", \"filters\": [], \"top_n\": \"\"}", "raw": "{\"status\":\"ok\",\"measure\":\"invoice.avg_total\",\"filters\":[],\"top_n\":\"\"}"}
+{"id": "CHINOOK-016", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-017", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-018", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-019", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-020", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-021", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-022", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-023", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-024", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-025", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-026", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-027", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-028", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-029", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-030", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-031", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-032", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-033", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-034", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-035", "db": "chinook", "intent": "{\"status\": \"needs_clarification\", \"concept\": \"best_customer\"}", "raw": "{\"status\":\"needs_clarification\",\"concept\":\"best_customer\"}"}
+{"id": "CHINOOK-036", "db": "chinook", "intent": "{\"status\": \"needs_clarification\", \"concept\": \"popular_track\"}", "raw": "{\"status\":\"needs_clarification\",\"concept\":\"popular_track\"}"}
+{"id": "CHINOOK-037", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-038", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
+{"id": "CHINOOK-039", "db": "chinook", "intent": "{\"status\": \"not_expressible\", \"concept\": \"customer_age\"}", "raw": "{\"status\":\"not_expressible\",\"concept\":\"customer_age\"}"}
+{"id": "CHINOOK-040", "db": "chinook", "intent": "{\"status\": \"uncovered\"}", "raw": "{\"status\":\"uncovered\"}"}
